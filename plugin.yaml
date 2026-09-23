@@ -1,0 +1,8 @@
+name: write-gate
+version: "1.0.0"
+description: "Hermes Agent 桌面端插件：写操作确认闸门。拦截 write_file/patch/memory/execute_code（代码含写模式），锁定状态下发起被拦，模型呈现方案并调 Hermes 内置 clarify 出确认卡。点「按此方案执行」=本轮回复内全部写入静默（下一条消息自动重锁）；卡上自定义框表达免问意图=本会话静默（反悔=重启/新会话/插件页开关）。自由回复由主模型语义分类。无 clarify UI 的平台（oneshot/cron/qqbot/眼镜）与子代理自动豁免；插件故障 fail-open。"
+author: custom
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+  - on_session_end
