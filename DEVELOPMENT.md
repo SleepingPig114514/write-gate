@@ -5,7 +5,7 @@
 ## 仓库身份
 
 - GitHub: https://github.com/SleepingPig114514/write-gate
-- 当前版本：v1.0.0（HEAD: `860bea1`）
+- 当前版本：v1.0.0（HEAD: `9bbc85b`）
 - 运行时副本：`C:\Users\12\AppData\Local\hermes\plugins\write-gate\`（Hermes 按需 import）
 - 用户文档：[README.md](README.md)
 
@@ -44,7 +44,7 @@
 | `README.md` | **终端用户** | 低 — 但改坏会影响用户理解 |
 | `CHANGELOG.md` | 终端用户 + 开发者 | 低 — 文档 |
 | `LICENSE` | — | 极低 — 别动 |
-| `DEVELOPMENT.md` | 开发者 | 低 — 别 cp 到 Hermes |
+| `DEVELOPMENT.md` | 开发者 | 低 — 别 cp 到 Hermes（**仅仓库存在，Hermes 副本不装**） |
 
 ## 发布流程（变更 → GitHub → Hermes 副本）
 
