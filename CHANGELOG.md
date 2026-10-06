@@ -2,6 +2,30 @@
 
 本仓库所有版本变更都会记录在此文件。版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.1.0] - 2026-10-07
+
+### 概述
+
+扩面：命令/系统状态变更纳入闸门管辖。起因是一次真实越权——Hermes 自更新把服务化的 `hermes.exe` 入口换成了 `hermes.cmd`，修复过程中 agent 经 `execute_code → subprocess → powershell → nssm set` 改了服务配置，全程未触任何确认：文件写拦得住，命令拦不住（terminal 不在受管面，execute_code 写正则只认文件写模式）。
+
+### 变更
+
+- `_MANAGED` 增加 `terminal`：命令按 `&&`/`|`/`;`/换行切段，任一段命中 `_STATE_PATTERNS` 黑名单即拦；默认放行（黑名单方向，误判代价 = 多弹一卡）
+- `_STATE_PATTERNS`（terminal 与 execute_code 共用，带注释常量，扩充原则见 README）：服务状态（net/sc 变更子命令、nssm 变更动词）、计划任务、杀进程、注册表写、文件系统变更（rm/mv/cp/Remove-Item 等）、包安装、git 写操作、PowerShell 变更动词（限系统对象）、wmic 变更、hermes 自身变更子命令
+- `execute_code` 判定升级：除原文件写模式外，新增括号配平抽取 `subprocess.*` 调用参数（原始 blob + 字符串字面量还原两个视角）比对黑名单——封"在代码里 shell 出去改状态"这条绕行路线
+- 修复 v1.0.0 遗留笔误：`_WRITE_PATTERNS` 重定向检测字符类误写成 `[>'>]`（混入撇号），导致所有带引号参数的 subprocess 调用被误判为写；修正为 `>{1,2}`，只读 subprocess 调用恢复放行
+- 阻断文案同步：拦的是"写操作/命令"，方案呈现要求含命令级目标
+
+### 已知盲区（本版不解决，如实）
+
+- `powershell -EncodedCommand <base64>` / `cmd /c "<嵌套>"` 载荷内容不可见，只拦外层动词命中
+- 重定向写文件（`> file`）不入 terminal 名单（漏判后果 = 文件写，已被 write_file/patch 通道管辖）
+- 引号内含 `&&` 的命令会被切段（罕见，代价仅多弹一卡）
+
+### 验收
+
+离线断言集（scripts/test_gate.py）：7 类黑名单必拦 + 11 类只读必放 + 2 类 subprocess 注入必拦 + 引号 blob + 解锁回归；EncodedCommand 盲区样本单独列出、不作通过断言。
+
 ## [1.0.0] - 2026-09-27
 
 ### 概述

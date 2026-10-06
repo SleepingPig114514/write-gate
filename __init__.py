@@ -1,4 +1,4 @@
-"""write-gate — 确认闸门（没按过按钮就不许写）。
+"""write-gate — 确认闸门（没按过按钮就不许写/改状态）。
 
 插件的唯一职责：动工前给用户一个按钮。三级确认范围：
   · 单次回复（默认）：点「按此方案执行」→ 本轮 agent 运行内全部写入静默；
@@ -8,8 +8,11 @@
   · 所有会话：设置→插件 页拨 write-gate 开关。
 不判定路径、不设时间窗、不维护白名单——范围与计划是模型和用户之间的事。
 
-拦截 write_file / patch / memory / execute_code(代码含写模式)：
+拦截 write_file / patch / memory / execute_code(代码含写模式或状态变更) /
+terminal(命令命中状态变更黑名单)：
 锁定状态下发起一律 block，指示模型「正文呈现方案 → 调 clarify 出确认卡」。
+terminal 走黑名单方向：默认放行，仅命中 _STATE_PATTERNS 才拦（防糊涂不防执意；
+漏判退回无闸门状态，误判代价 = 多弹一张卡）。
 fail-open：本插件任何内部异常都放行（最坏退回无闸门状态，不卡死会话）。
 豁免：非 desktop 来源会话（oneshot/cron/qqbot 等无确认卡 UI）、delegation 子会话
 （clarify 被禁用，防死锁）、环境变量 WRITE_GATE=off。
@@ -23,26 +26,146 @@ import os
 import re
 import threading
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 APPROVE_LABEL = "按此方案执行"
-_MANAGED = ("write_file", "patch", "memory", "execute_code")
+_MANAGED = ("write_file", "patch", "memory", "execute_code", "terminal")
 
 _LOCK = threading.Lock()
 # session_id -> (scope, turn_id)；scope ∈ {"turn","session"}
 _unlock: Dict[str, Tuple[str, str]] = {}
 _source_cache: Dict[str, tuple] = {}         # session_id -> (source, parent, ts)
 
-# execute_code 写模式：命中任一即视为写操作。防糊涂不防执意（README 有言在先）。
+# execute_code 文件写模式：命中任一即视为写操作。防糊涂不防执意（README 有言在先）。
 _WRITE_PATTERNS = [
     re.compile(r"\bopen\s*\([^)]{0,200}?['\"][wax][+btu]*['\"]"),
     re.compile(r"\bshutil\.(copy\w*|move|rmtree|remove|unlink)\b"),
     re.compile(r"\bos\.(remove|unlink|rename|replace|makedirs?|rmdir|truncate)\b"),
     re.compile(r"\.write_text\s*\(|\.write_bytes\s*\(|\.touch\s*\(|\.mkdir\s*\(|\.unlink\s*\(|\.rename\s*\("),
-    re.compile(r"\bsubprocess\.\w+\b[^#\n]*[>'>]{1,2}\s*\S"),
+    # 注：v1.0.0 此处字符类误写为 [>'>]（含撇号），会把任何带引号参数的 subprocess 调用误判为重定向写；1.1.0 修正为纯重定向检测，状态变更判定改由 _STATE_PATTERNS blob 扫描承担
+    re.compile(r"\bsubprocess\.\w+\b[^#\n]*>{1,2}\s*\S"),
 ]
+
+# ── 状态变更黑名单（terminal 与 execute_code 内 subprocess 共用，v1.1.0）──────
+# 方向性契约：默认放行、命中才拦。漏判 = 退回无闸门（不恶化）；误判 = 多弹一卡。
+# 扩充原则：只在真实漏判发生后补条目，条目须写明拦什么/放什么，防误伤扩散。
+_STATE_PATTERNS = [
+    # 1 服务/系统状态：net/sc 变更子命令（查询类 sc query、netstat 不拦）；
+    #   nssm 需 60 字符内带变更动词（nssm get/status 只读不拦）
+    re.compile(r"\b(?:net|sc(?:\.exe)?)\s+(?:start|stop|delete|create|config|pause|continue)\b", re.I),
+    re.compile(r"\bnssm\b[\s\S]{0,60}?\b(?:set|install|remove|start|stop|restart|pause|continue)\b", re.I),
+    # 2 计划任务：创建/删除/修改；Query 不拦
+    re.compile(r"\bschtasks\s+/(?:create|delete|change)\b", re.I),
+    re.compile(r"\b(?:Register-|Unregister-|Set-)ScheduledTask\b", re.I),
+    # 3 杀进程（高危不可逆）；tasklist 只读不在列
+    re.compile(r"\btaskkill\b", re.I),
+    # 4 注册表写入；reg query 不拦
+    re.compile(r"\breg(?:\.exe)?\s+(?:add|delete|import|restore|load|unload)\b", re.I),
+    # 5 文件系统变更（POSIX 与 cmd/PowerShell 形态；须带参数，孤立词不算）
+    re.compile(r"\b(?:rm|rmdir|del|erase|ren|unlink)\s+\S"),
+    re.compile(r"\b(?:mv|cp)\s+(?:-{1,2}\w+\s+)*\S+\s+\S+", re.I),
+    re.compile(r"\bremove[\s_\-]*(?:item|file)\b", re.I),
+    # 6 安装/包管理
+    re.compile(r"\b(?:winget|choco)\s+(?:install|uninstall|update|upgrade)\b", re.I),
+    re.compile(r"\b(?:npm|pnpm|yarn|pip|pip3|uv|cargo)\s+(?:install|uninstall|add|remove|update)\b", re.I),
+    re.compile(r"\binstall[\s_\-]*package\b", re.I),
+    # 7 git 写操作（提交/推送/改写工作区）；status/log/diff 只读不拦
+    re.compile(r"\bgit\s+(?:push|commit|checkout|restore|reset|clean|merge|rebase|stash|apply|tag)\b"),
+    # 8 PowerShell 变更动词（cmdlet 形态；大写不敏感，兼容无连字符直调变体；
+    #   仅对系统对象生效——Set-Location/Get-* 类导航读取不拦）
+    re.compile(
+        r"\b(?:Set|New|Remove|Stop|Restart|Install|Uninstall|Disable|Enable|Add|Clear|"
+        r"Move|Copy|Rename|Format)[\s_\-]*(?:Service|Item|File|Process|Computer|Machine|Registry|"
+        r"Package|Scheduled[A-Za-z]*|Firewall|NetAdapter|Route|Task|User|LocalUser|"
+        r"Volume|Disk|Partition|ExecutionPolicy)\b", re.I),
+    re.compile(r"\brestart[\s_\-]*computer\b", re.I),
+    # 9 wmic 变更子命令；list/get 只读不拦
+    re.compile(r"\bwmic\b[^\n]*\b(?:modify|call|create|delete)\b", re.I),
+    # 10 Hermes 自身变更子命令（改本机安装/配置/注册状态）；--version、status、serve 不拦
+    re.compile(r"\bhermes\s+(?:update|install|uninstall|gateway\s+install|config\s+set"
+               r"|cron\s+(?:add|remove|edit)|skills?\s+(?:add|remove|install)"
+               r"|computer-use\s+install|vault\s+add)\b", re.I),
+]
+
+# 拆段：管道/串联命令逐段检查，防 "ls && rm -rf x" 躲过首词判定。
+# 已知简化：不感知引号内分隔符——引号里含 && 的命令罕见，误伤代价仅多弹一卡。
+_SEGMENT_SPLIT_RX = re.compile(r"&&|\|\||[;\n\r|]")
+# subprocess 调用抽取（括号配平，见 _subprocess_blobs）
+_SUBPROC_CALL_RX = re.compile(r"\bsubprocess\.\w+\s*\(")
+_STR_LIT_RX = re.compile(r"'([^']*)'|\"([^\"]*)\"")
+
+
+def _segments(cmd: str) -> List[str]:
+    return [s for s in _SEGMENT_SPLIT_RX.split(cmd) if s.strip()]
+
+
+def _hit_state(text: str) -> bool:
+    return any(rx.search(seg) for seg in _segments(text) for rx in _STATE_PATTERNS)
+
+
+def _terminal_is_write(command: str) -> bool:
+    """terminal 命令段逐一比对黑名单；命中任一段即算状态变更。"""
+    if not isinstance(command, str):
+        return False
+    return _hit_state(command)
+
+
+def _subprocess_blobs(code: str) -> List[str]:
+    """抽取代码里每个 subprocess 调用的参数文本（括号配平，容忍字符串）。"""
+    blobs = []
+    for m in _SUBPROC_CALL_RX.finditer(code):
+        i, depth, instr, out = m.end(), 1, None, []
+        n = len(code)
+        while i < n and depth > 0:
+            ch = code[i]
+            if instr:
+                out.append(ch)
+                if ch == "\\":
+                    out.append(code[i + 1] if i + 1 < n else "")
+                    i += 2
+                    continue
+                if ch == instr:
+                    instr = None
+            elif ch in "\"'":
+                instr = ch
+                out.append(ch)
+            elif ch == "(":
+                depth += 1
+                out.append(ch)
+            elif ch == ")":
+                depth -= 1
+                if depth > 0:
+                    out.append(ch)
+            else:
+                out.append(ch)
+            i += 1
+        blobs.append("".join(out))
+    return blobs
+
+
+def _unquote_join(blob: str) -> str:
+    """字符串字面量内容还原成单行文本（覆盖 list 形参把命令拆成碎片的情况）。"""
+    parts = []
+    for a, b in _STR_LIT_RX.findall(blob):
+        s = a or b
+        if s.strip():
+            parts.append(s)
+    return " ".join(parts)
+
+
+def _exec_is_write(args: Dict[str, Any]) -> bool:
+    """execute_code：沿用文件写模式 + 扫 subprocess 参数里的状态变更命令。"""
+    code = args.get("code") or ""
+    if not isinstance(code, str):
+        return False
+    if any(rx.search(code) for rx in _WRITE_PATTERNS):
+        return True
+    for blob in _subprocess_blobs(code):
+        if _hit_state(blob) or _hit_state(_unquote_join(blob)):
+            return True
+    return False
 
 
 def _env_off() -> bool:
@@ -88,19 +211,20 @@ def _exempt(session_id: str) -> bool:
 
 
 def _is_write(tool_name: str, args: Dict[str, Any]) -> bool:
-    """该调用是否落在受管写操作上（execute_code 仅当代码含写模式）。"""
+    """该调用是否落在受管写/状态变更操作上。"""
     if tool_name in ("write_file", "patch", "memory"):
         return True
     if tool_name == "execute_code":
-        code = args.get("code") or ""
-        return any(rx.search(code) for rx in _WRITE_PATTERNS)
+        return _exec_is_write(args)
+    if tool_name == "terminal":
+        return _terminal_is_write(args.get("command") or "")
     return False
 
 
 _BLOCK_MSG = (
-    "[write-gate] 该写操作未获用户确认，已被拦下（文件/记忆未发生任何变化）。\n"
+    "[write-gate] 该写操作/命令未获用户确认，已被拦下（文件/记忆/系统状态未发生任何变化）。\n"
     "请严格按以下流程处理：\n"
-    "1) 在回复正文向用户呈现方案：本次要执行的全部写入目标（路径级）、目的与步骤；\n"
+    "1) 在回复正文向用户呈现方案：本次要执行的全部变更目标（路径级/命令级）、目的与步骤；\n"
     f"2) 调用 clarify 请用户拍板，问题附选项：「{APPROVE_LABEL}」（放第一个）、「取消」；"
     "用户可在自定义框补充意见；\n"
     "3) 卡片中注明：批准后本轮回复内不再询问，用户下一条消息起恢复确认；\n"
