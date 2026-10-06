@@ -1,11 +1,11 @@
 # write-gate Development
 
-开发文档。给改这个仓库的人看。**不会被复制到 Hermes 运行时副本**（只 cp `__init__.py / plugin.yaml / README.md / CHANGELOG.md`）。
+开发文档。给改这个仓库的人看。**不会被复制到 Hermes 运行时副本**（只 cp `__init__.py / plugin.yaml / README.md / CHANGELOG.md / scripts/test_gate.py`）。
 
 ## 仓库身份
 
 - GitHub: https://github.com/SleepingPig114514/write-gate
-- 当前版本：v1.0.0（HEAD: `9bbc85b`）
+- 当前版本：v1.1.1（HEAD: `def3aa3`）
 - 运行时副本：`C:\Users\12\AppData\Local\hermes\plugins\write-gate\`（Hermes 按需 import）
 - 用户文档：[README.md](README.md)
 
@@ -24,7 +24,7 @@
 | 改在哪儿 | 怎么同步到对方 |
 |---|---|
 | 本仓库 → 推 GitHub | `git push origin main` |
-| 本仓库 → 装到 Hermes | `cp __init__.py plugin.yaml README.md CHANGELOG.md "C:/Users/12/AppData/Local/hermes/plugins/write-gate/"`（**不** cp DEVELOPMENT.md） |
+| 本仓库 → 装到 Hermes | `cp __init__.py plugin.yaml README.md CHANGELOG.md scripts/test_gate.py "C:/Users/12/AppData/Local/hermes/plugins/write-gate/"`（副本需先建 `scripts/` 目录；**不** cp DEVELOPMENT.md） |
 | Hermes 那份改了 → 回本仓库 | 手动复制文件 + `git diff` 检查 + commit |
 | GitHub 拉新 → 本仓库 | `git pull origin main` |
 
