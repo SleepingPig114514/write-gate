@@ -91,10 +91,25 @@ _STATE_PATTERNS = [
 
 # 拆段：管道/串联命令逐段检查，防 "ls && rm -rf x" 躲过首词判定。
 # 已知简化：不感知引号内分隔符——引号里含 && 的命令罕见，误伤代价仅多弹一卡。
-_SEGMENT_SPLIT_RX = re.compile(r"&&|\|\||[;\n\r|]")
+_SEGMENT_SPLIT_RX = re.compile(r"&&|\|\||[;\n|]")
 # subprocess 调用抽取（括号配平，见 _subprocess_blobs）
 _SUBPROC_CALL_RX = re.compile(r"\bsubprocess\.\w+\s*\(")
 _STR_LIT_RX = re.compile(r"'([^']*)'|\"([^\"]*)\"")
+
+# 探查降级：段带 --help/-h/--dry-run/? 类只读探查标志，且标志之后不再跟真实操作数
+# （只剩 2>&1 类重定向碎片）时，该段跳过黑名单——"hermes gateway install --help"
+# 这种探参数不该拦。已知代价：执意者在危险命令尾部附加 --help 可骗过降级
+# （与 EncodedCommand 同为防糊涂不防执意，README 边界）。
+_PROBE_FLAG_RX = re.compile(r"(?:^|\s)(?:--help|-h|--dry-run|/\?|\?)(?=\s|$)")
+_PROBE_JUNK_RX = re.compile(r"^[\d<>]")
+
+
+def _segment_is_probe(seg: str) -> bool:
+    m = _PROBE_FLAG_RX.search(seg)
+    if not m:
+        return False
+    rest = seg[m.end():].split()
+    return all(_PROBE_JUNK_RX.match(t) for t in rest)
 
 
 def _segments(cmd: str) -> List[str]:
@@ -102,7 +117,9 @@ def _segments(cmd: str) -> List[str]:
 
 
 def _hit_state(text: str) -> bool:
-    return any(rx.search(seg) for seg in _segments(text) for rx in _STATE_PATTERNS)
+    return any(rx.search(seg)
+               for seg in _segments(text) if not _segment_is_probe(seg)
+               for rx in _STATE_PATTERNS)
 
 
 def _terminal_is_write(command: str) -> bool:
@@ -225,8 +242,9 @@ _BLOCK_MSG = (
     "[write-gate] 该写操作/命令未获用户确认，已被拦下（文件/记忆/系统状态未发生任何变化）。\n"
     "请严格按以下流程处理：\n"
     "1) 在回复正文向用户呈现方案：本次要执行的全部变更目标（路径级/命令级）、目的与步骤；\n"
-    f"2) 调用 clarify 请用户拍板，问题附选项：「{APPROVE_LABEL}」（放第一个）、「取消」；"
-    "用户可在自定义框补充意见；\n"
+    f"2) 调用 clarify 出执行确认卡：问题正文写明同意范围（目标文件/命令清单/边界），"
+    f"选项恒为「{APPROVE_LABEL}」（放第一个）与「取消」两项；"
+    "用户可在自定义框补充意见，意见由语义分类判范围，拿不准维持锁定；\n"
     "3) 卡片中注明：批准后本轮回复内不再询问，用户下一条消息起恢复确认；\n"
     "4) 用户批准后，重试本调用即自动放行；用户提出修改意见时，按意见更新方案后重新出卡，"
     "不要自行猜测放行。\n"
@@ -271,6 +289,9 @@ def _classify(llm: Any, text: str) -> str:
             input=[{"type": "text", "text": text[:2000]}],
             json_mode=True, max_tokens=64, temperature=0.0, timeout=15,
             purpose="write-gate scope",
+            # 分类走 auxiliary.approval 槽（需 plugins.entries.write-gate.llm.allow_task_override=true，
+            # 缺失时宿主按信任拒绝→异常→保守 NO，不影响锁定安全）；与主模型解耦，省主会话尾延迟
+            task="approval",
         )
         switch = (res.parsed or {}).get("switch", "") if hasattr(res, "parsed") else ""
         return switch if switch in ("TURN", "SESSION", "NO") else "NO"
@@ -301,7 +322,12 @@ def _on_post_tool_call(tool_name: str = "", result: Any = None, session_id: str 
                 _unlock[session_id] = ("turn", turn_id)      # ① 机械匹配：本轮放行
                 logger.info("write-gate: session %s unlocked TURN %s (mechanical)", session_id, turn_id)
                 return
-        # ② 自定义补充 → 语义分类（NO/LOCK 维持锁定）
+        # ② 全部回答恰为「取消」→ 机械判 NO 短路（零 LLM 调用——用户点拒绝不该花钱）
+        non_empty = [a.strip() for a in answers if a.strip()]
+        if non_empty and all(a == "取消" for a in non_empty):
+            logger.info("write-gate: session %s answered CANCEL (mechanical, no classify)", session_id)
+            return
+        # ③ 自定义补充 → 语义分类（NO/LOCK 维持锁定）
         switch = _classify(_LLM, joined)
         if switch in ("TURN", "SESSION"):
             with _LOCK:

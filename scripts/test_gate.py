@@ -68,6 +68,15 @@ TERM_PASS = [
     ("grep 过滤", "ls -la | grep foo"),
     ("EncodedCommand 外层", "powershell -NoProfile -EncodedCommand QQBhAGsA"),
     ("只读 PS", "powershell -NoProfile -Command \"Test-Path C:\\Users\\12; Get-Item C:\\x | Select-Object Length\""),
+    ("变更命令探参数（回放误伤修复）", "hermes gateway install --help 2>&1 || true"),
+    ("包安装探参数", "pip install requests --help"),
+]
+
+# ── terminal：必须拦（探查降级不可被骗——标志后面还有真实操作数/前段有变更）──
+TERM_BLOCK_PROBE_TRICK = [
+    ("串联藏变更", "rm -rf x && true --help"),
+    ("分号后探查救不了前段", "git commit -A; echo --help"),
+    ("真变更不带标志", "hermes gateway install"),
 ]
 
 # ── execute_code：必须拦（今天踩的绕行路线 + 原文件写）──────────────
@@ -101,6 +110,8 @@ def check(label, got, want):
 
 for label, cmd in TERM_BLOCK:
     check(f"term-block {label}", wg._terminal_is_write(cmd), True)
+for label, cmd in TERM_BLOCK_PROBE_TRICK:
+    check(f"term-block {label}", wg._terminal_is_write(cmd), True)
 for label, cmd in TERM_PASS:
     check(f"term-pass  {label}", wg._terminal_is_write(cmd), False)
 for label, code in EXEC_BLOCK:
@@ -125,5 +136,39 @@ assert r2 is None and r3 is None, "本轮解锁后写入/命令应静默放行"
 r4 = wg._on_pre_tool_call("terminal", {"command": "net start X"}, sid, t2)
 assert r4 and r4["action"] == "block", "下一条消息（新 turn）应重新锁定"
 
-print(f"\n断言总数: {len(TERM_BLOCK)+len(TERM_PASS)+len(EXEC_BLOCK)+len(EXEC_PASS)+4}, 失败: {fails}")
+# ── v1.1.1：解锁/短路路径机械判定（_classify 调用次数断言）───────────
+import json as _json, io, contextlib
+_calls = []
+class _FakeLLM:
+    def complete_structured(self, **kw):
+        _calls.append(kw)
+        class R: parsed = {"switch": "TURN"}
+        return R()
+wg._LLM = _FakeLLM()
+wg._exempt = lambda sid: False
+
+def _clarify_result(resp):
+    return _json.dumps({"responses": [{"question": "q", "user_response": resp,
+                                        "choices_offered": ["按此方案执行", "取消"], "status": "answered"}]})
+
+def _post(resp, sid, tid):
+    _calls.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        wg._on_post_tool_call("clarify", _clarify_result(resp), sid, tid)
+    return len(_calls)
+
+s, t1 = "s-v111", "t-1"
+# ① 点标准批准：机械放行，零分类
+n = _post("按此方案执行", s, t1)
+check("unlock-no-classify", (n == 0 and wg._unlock.get(s, (None,))[0] == "turn"), True)
+# ② 点取消：机械 NO 短路，零分类、不解锁
+s2, t2 = "s-v111b", "t-2"
+n = _post("取消", s2, t2)
+check("cancel-mech-zero-llm", (n == 0 and s2 not in wg._unlock), True)
+# ③ 自由文本意见：恰好一次分类（走 approval 任务槽）
+s3, t3 = "s-v111c", "t-3"
+n = _post("先把X改成Y再做", s3, t3)
+check("free-text-one-classify", (n == 1 and _calls and _calls[0].get("task") == "approval"), True)
+
+print(f"\n断言总数: {len(TERM_BLOCK)+len(TERM_BLOCK_PROBE_TRICK)+len(TERM_PASS)+len(EXEC_BLOCK)+len(EXEC_PASS)+4+3}, 失败: {fails}")
 sys.exit(1 if fails else 0)
