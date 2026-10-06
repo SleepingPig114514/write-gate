@@ -5,6 +5,7 @@
 ## 仓库身份
 
 - GitHub: https://github.com/SleepingPig114514/write-gate
+- Gitee 镜像: https://gitee.com/he-shuying/write-gate
 - 当前版本：v1.1.1（HEAD: `def3aa3`）
 - 运行时副本：`C:\Users\12\AppData\Local\hermes\plugins\write-gate\`（Hermes 按需 import）
 - 用户文档：[README.md](README.md)
@@ -24,6 +25,7 @@
 | 改在哪儿 | 怎么同步到对方 |
 |---|---|
 | 本仓库 → 推 GitHub | `git push origin main` |
+| 本仓库 → 推 Gitee | `git push gitee main` |
 | 本仓库 → 装到 Hermes | `cp __init__.py plugin.yaml README.md CHANGELOG.md scripts/test_gate.py "C:/Users/12/AppData/Local/hermes/plugins/write-gate/"`（副本需先建 `scripts/` 目录；**不** cp DEVELOPMENT.md） |
 | Hermes 那份改了 → 回本仓库 | 手动复制文件 + `git diff` 检查 + commit |
 | GitHub 拉新 → 本仓库 | `git pull origin main` |
@@ -52,7 +54,7 @@
 2. 改 `plugin.yaml` 的 `version`（如 `1.0.0` → `1.0.1`）
 3. 改 `CHANGELOG.md`，加新条目（描述本版本改了什么）
 4. `git add . && git commit -m "Release vX.Y.Z: ..."`
-5. `git push origin main`
+5. `git push origin main` 与 `git push gitee main`（两端保持同步）
 6. `cp __init__.py plugin.yaml README.md CHANGELOG.md "C:/Users/12/AppData/Local/hermes/plugins/write-gate/"`
 7. （可选）重启 gateway 让插件代码立即重读：`hermes gateway restart`
 
