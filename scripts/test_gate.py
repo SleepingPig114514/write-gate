@@ -308,7 +308,14 @@ check("thr-session-scope-never-delegates", _pre("patch", one_line_patch, s, t_) 
 
 s, t_ = _arm(True, 10)
 _pre("patch", many_line_patch, s, t_)
-check("thr-fallback-second-attempt-passes", _pre("patch", many_line_patch, s, t_) is None, True)
+check("thr-retry-same-turn-still-delegates",
+      _pre("patch", many_line_patch, s, t_) == {"action": "block", "message": D}, True)
+
+# 方案 B：本轮不放行 → 重试不能绕过；换 turn 后 _unlock 失效 = 回到"未确认"
+s, t_ = _arm(True, 10)
+_pre("patch", many_line_patch, s, t_)
+check("thr-new-turn-relocks",
+      _pre("patch", many_line_patch, s, "t-next") == {"action": "block", "message": wg._BLOCK_MSG}, True)
 
 # 按轮累计（v1.1.7）：同轮 12+12 ≥ 20 → 第二次转派；换 turn 清零后仍直写
 s, t_ = _arm(True, 20)
@@ -342,8 +349,9 @@ s, t_ = _arm(True, 20)
 check("thr-one-over-limit-delegates", _pre("patch", over21, s, t_) == {"action": "block", "message": D}, True)
 
 check("msg-item5-concurrency-clause",
-      ("delegate_task(action='list')" in D and "双方都只读 → 直接并行" in D
-       and "可判定的写完信号" in D and "确认信号后再采用读到的内容" in D
+      ("delegate_task(action='list')" in D and "文件不重合的独立新活 → 新派" in D
+       and "改动文件与它手上的重合" in D and "拿不准就 steer" in D
+       and "不要让它 sleep 或轮询" in D
        and "临时文件只写 TMPDIR" in D), True)
 check("msg-items-1to4-intact",
       ("1) 不要重试本调用" in D and "4) 子代理的回报如实转述" in D), True)

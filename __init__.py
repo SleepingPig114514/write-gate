@@ -228,6 +228,21 @@ def _env_off() -> bool:
     return os.environ.get("WRITE_GATE", "").strip().lower() in {"off", "0", "no", "false"}
 
 
+def _plugin_version() -> str:
+    """从同目录 plugin.yaml 读版本号，只用于启动日志（读不到返回 "?"）。
+
+    存在的意义：插件代码只在网关启动时装载，改完文件没重启时行为仍是旧的。
+    启动日志里有版本号 + 目录，一眼就能判断"跑的是不是改过的那份"。
+    """
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugin.yaml")
+        with open(path, "r", encoding="utf-8-sig") as f:
+            m = re.search(r'^version:\s*"?([\w.\-]+)', f.read(), re.M)
+        return m.group(1) if m else "?"
+    except Exception:
+        return "?"
+
+
 def _now() -> float:
     return time.time()
 
@@ -431,10 +446,13 @@ _DELEGATE_MSG = (
     "   · 回报要求：实际改了哪些文件，每个文件的最终字节数与 SHA256。\n"
     "3) 只派一次；派发后向用户给一行状态并结束本轮，本轮不要继续尝试写入。\n"
     "4) 子代理的回报如实转述给用户（文件、字节数、哈希），不要替它补写未核实的结果。\n"
-    "5) 派发前用 delegate_task(action='list') 核对仍在跑的子代理：同一文件上双方都只读 → 直接并行；\n"
-    "   任一方要写 → 在 brief 里写明该文件正由谁使用，并指定一个可判定的写完信号（末行标记 / 旁边的 .done 文件 / 大小连续两次检查不变），确认信号后再采用读到的内容，\n"
-    "   等不到就先做其余部分。\n"
-    "说明：子代理会话不受本闸门拦截；本轮闸门只转派这一次，之后的重试直接放行。"
+    "5) 派发前先 delegate_task(action='list') 看有没有在跑的子代理：\n"
+    "   这次的改动文件与它手上的重合 → 用 action='steer' 把要求追加给它，不新派；\n"
+    "   文件不重合的独立新活 → 新派。拿不准就 steer（同一个写者不会互相覆盖，只是慢一点）。\n"
+    "   子代理之间不互相等待：不要让它 sleep 或轮询另一个子代理的产出。\n"
+    "   steer 之后确认它的回执覆盖了追加内容，没覆盖就等它结束再补派。\n"
+    "说明：子代理会话不受本闸门拦截；本轮不再放行——重试同一写入只会再收到这份指令，"
+    "直到本轮结束（下一轮重新上锁、需重新批准）。"
 )
 
 
@@ -459,20 +477,23 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "
             # 只有「按此方案执行」产生的单轮放行可转派：SESSION 级（用户说"别问了"）
             # 保持旧行为，否则那种会话会每条消息都派一个子代理。memory 不转派：
             # 子代理没有 memory 工具（工具层禁用），转过去必然空转。
-            redirectable = bool(
-                unlocked and u and u[0] == "turn" and u[1] == turn_id and turn_id
-                and tool_name != "memory"
-                and _redirected.get(session_id) != turn_id
-            )
+            turn_scoped = bool(unlocked and u and u[0] == "turn" and turn_id
+                               and tool_name != "memory")
+            already = bool(turn_scoped and _redirected.get(session_id) == turn_id)
         if not unlocked:
             return {"action": "block", "message": _BLOCK_MSG}
-        if redirectable and _delegate_after_approval() and not _accumulated_below_threshold(
-                tool_name, args, session_id, turn_id):
-            with _LOCK:
-                _redirected[session_id] = turn_id
-            logger.info("write-gate: session %s redirecting approved %s to subagent (turn %s)",
-                        session_id, tool_name, turn_id)
-            return {"action": "block", "message": _DELEGATE_MSG}
+        if turn_scoped and _delegate_after_approval():
+            if already:
+                # 本轮已转派过：不放行，重复同一份指令。重试不能把转派绕过去；
+                # 下一轮 turn_id 变化后 _unlock 失效，重新回到"未确认"、需重新批准，
+                # 所以不放行也不会死锁。
+                return {"action": "block", "message": _DELEGATE_MSG}
+            if not _accumulated_below_threshold(tool_name, args, session_id, turn_id):
+                with _LOCK:
+                    _redirected[session_id] = turn_id
+                logger.info("write-gate: session %s redirecting approved %s to subagent (turn %s)",
+                            session_id, tool_name, turn_id)
+                return {"action": "block", "message": _DELEGATE_MSG}
         return None
     except Exception as err:                        # fail-open
         logger.warning("write-gate pre_tool_call error (pass-through): %s", err)
@@ -586,6 +607,12 @@ def register(ctx) -> None:
     global _LLM, _CTX
     _LLM = ctx.llm
     _CTX = ctx
+    try:
+        logger.info("write-gate %s loaded from %s (delegate_after_approval=%s, delegate_min_lines=%s)",
+                    _plugin_version(), os.path.dirname(os.path.abspath(__file__)),
+                    _delegate_after_approval(), _delegate_min_lines())
+    except Exception as err:                        # 日志失败不能拖垮装载
+        logger.warning("write-gate startup log failed: %s", err)
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_hook("on_session_end", _on_session_end)
