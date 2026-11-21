@@ -6,6 +6,9 @@
   · 单次会话：确认卡自定义框表达"这个会话都别问了" → 会话级放行，
     反悔方式 = 重启或新开会话（解锁态纯内存，新会话天然锁定）；
   · 所有会话：设置→插件 页拨 write-gate 开关。
+  · 转派子代理（默认关，「能力→插件」页开关）：打开后点「按此方案执行」不再由主模型
+    重试写入，而是拦下本次调用、由模型派 delegate_task 执行；同一轮再次重试则直接放行
+    （宁可退化不死锁）。
 不判定路径、不设时间窗、不维护白名单——范围与计划是模型和用户之间的事。
 
 拦截 write_file / patch / memory / execute_code(代码含写模式或状态变更) /
@@ -14,8 +17,12 @@ terminal(命令命中状态变更黑名单)：
 terminal 走黑名单方向：默认放行，仅命中 _STATE_PATTERNS 才拦（防糊涂不防执意；
 漏判退回无闸门状态，误判代价 = 多弹一张卡）。
 fail-open：本插件任何内部异常都放行（最坏退回无闸门状态，不卡死会话）。
-豁免：非 desktop 来源会话（oneshot/cron/qqbot 等无确认卡 UI）、delegation 子会话
-（clarify 被禁用，防死锁）、环境变量 WRITE_GATE=off。
+豁免：无确认卡 UI 的来源（cron/oneshot/qqbot/unknown）、delegation 子会话；
+交互来源（desktop/local/gui/tui）一律进闸门——2026-10-27 起桌面端会话来源变成 local，
+原来的「不等于 desktop 就豁免」让桌面会话全部被静默放过。
+（clarify 被禁用，防死锁）、环境变量 WRITE_GATE=off、后台自我改进回顾的 memory 写入
+（review fork 与主会话共享 session_id，按来源判据识别不出来，clarify 又不在其白名单；
+上游 memory_tool 自带 _background_delete_gate，负责把 patch/remove 转 pending 待批）。
 """
 
 from __future__ import annotations
@@ -37,56 +44,80 @@ _LOCK = threading.Lock()
 # session_id -> (scope, turn_id)；scope ∈ {"turn","session"}
 _unlock: Dict[str, Tuple[str, str]] = {}
 _source_cache: Dict[str, tuple] = {}         # session_id -> (source, parent, ts)
+# session_id -> turn_id：本轮已把「已批准的写入」导向 delegate_task 一次。
+# 只认当前 turn（turn 变了自然失效）；命中即放行 = 兜底，宁可退化不肯死锁。
+_redirected: Dict[str, str] = {}
 
 # execute_code 文件写模式：命中任一即视为写操作。防糊涂不防执意（README 有言在先）。
 _WRITE_PATTERNS = [
-    re.compile(r"\bopen\s*\([^)]{0,200}?['\"][wax][+btu]*['\"]"),
+    # v1.1.3 修：旧字符类 [wax][+btu]* 只认 w/a/x 开头的模式，漏了 open(f,'r+') / ('r+b')
+    # 这类"读改"可写模式；补 (?:[rbtu]*[wax][+btu]*|[rbtu]*\+[btu]*) 分支，只读 r/rb/rt 仍放行
+    re.compile(r"\bopen\s*\([^)]{0,200}?['\"](?:[rbtu]*[wax][+btu]*|[rbtu]*\+[btu]*)['\"]"),
     re.compile(r"\bshutil\.(copy\w*|move|rmtree|remove|unlink)\b"),
     re.compile(r"\bos\.(remove|unlink|rename|replace|makedirs?|rmdir|truncate)\b"),
     re.compile(r"\.write_text\s*\(|\.write_bytes\s*\(|\.touch\s*\(|\.mkdir\s*\(|\.unlink\s*\(|\.rename\s*\("),
     # 注：v1.0.0 此处字符类误写为 [>'>]（含撇号），会把任何带引号参数的 subprocess 调用误判为重定向写；1.1.0 修正为纯重定向检测，状态变更判定改由 _STATE_PATTERNS blob 扫描承担
     re.compile(r"\bsubprocess\.\w+\b[^#\n]*>{1,2}\s*\S"),
+    # hermes_tools 程序化助手（v1.1.2 补）：execute_code 内 from hermes_tools import
+    # write_file / patch / terminal 会绕过工具层 pre_tool_call 钩子直接落盘——2026-10-10
+    # 实测确认（锁定态下 execute_code 内 write_file 写盘成功，同轮直接 write_file 被拦）。
+    # 按静态形态兜住直接调用；别名导入（import hermes_tools as ht）仍是盲区，
+    # 防糊涂不防执意，README「已知边界」已记。
+    re.compile(r"\bfrom\s+hermes_tools\b[\s\S]{0,160}?\b(?:write_file|patch|terminal)\b"),
+    re.compile(r"\bhermes_tools\s*\.\s*(?:write_file|patch|terminal)\b"),
 ]
 
 # ── 状态变更黑名单（terminal 与 execute_code 内 subprocess 共用，v1.1.0）──────
 # 方向性契约：默认放行、命中才拦。漏判 = 退回无闸门（不恶化）；误判 = 多弹一卡。
 # 扩充原则：只在真实漏判发生后补条目，条目须写明拦什么/放什么，防误伤扩散。
-_STATE_PATTERNS = [
+# 每条 = (正则, 可否被探参数降级)：可降级 = 该段尾挂 --help/-h/--dry-run/? 时免检。
+# 仅"可重复、可回滚、且 CLI 遇 --help 先打印帮助退出"的类目可降级（包安装/包管理/
+# hermes 自身/git 写操作）；删除、杀进程、服务停止、注册表写、文件系统变更、wmic、
+# PowerShell 变更动词一律不可降级——v1.1.3 修：旧版对任何段一律免检，危险命令尾部挂
+# 一个 --help 即可整段绕过闸门。大小写：Windows 命令不区分大小写（cmd/PowerShell 别名、
+# GIT/DEL），除有明确理由者外一律带 re.I——v1.1.3 修：第 5 类与 git 类曾漏 re.I。
+_STATE_PATTERNS: List[Tuple[re.Pattern, bool]] = [
     # 1 服务/系统状态：net/sc 变更子命令（查询类 sc query、netstat 不拦）；
-    #   nssm 需 60 字符内带变更动词（nssm get/status 只读不拦）
-    re.compile(r"\b(?:net|sc(?:\.exe)?)\s+(?:start|stop|delete|create|config|pause|continue)\b", re.I),
-    re.compile(r"\bnssm\b[\s\S]{0,60}?\b(?:set|install|remove|start|stop|restart|pause|continue)\b", re.I),
-    # 2 计划任务：创建/删除/修改；Query 不拦
-    re.compile(r"\bschtasks\s+/(?:create|delete|change)\b", re.I),
-    re.compile(r"\b(?:Register-|Unregister-|Set-)ScheduledTask\b", re.I),
-    # 3 杀进程（高危不可逆）；tasklist 只读不在列
-    re.compile(r"\btaskkill\b", re.I),
-    # 4 注册表写入；reg query 不拦
-    re.compile(r"\breg(?:\.exe)?\s+(?:add|delete|import|restore|load|unload)\b", re.I),
-    # 5 文件系统变更（POSIX 与 cmd/PowerShell 形态；须带参数，孤立词不算）
-    re.compile(r"\b(?:rm|rmdir|del|erase|ren|unlink)\s+\S"),
-    re.compile(r"\b(?:mv|cp)\s+(?:-{1,2}\w+\s+)*\S+\s+\S+", re.I),
-    re.compile(r"\bremove[\s_\-]*(?:item|file)\b", re.I),
-    # 6 安装/包管理
-    re.compile(r"\b(?:winget|choco)\s+(?:install|uninstall|update|upgrade)\b", re.I),
-    re.compile(r"\b(?:npm|pnpm|yarn|pip|pip3|uv|cargo)\s+(?:install|uninstall|add|remove|update)\b", re.I),
-    re.compile(r"\binstall[\s_\-]*package\b", re.I),
-    # 7 git 写操作（提交/推送/改写工作区）；status/log/diff 只读不拦
-    re.compile(r"\bgit\s+(?:push|commit|checkout|restore|reset|clean|merge|rebase|stash|apply|tag)\b"),
+    #   nssm 需 60 字符内带变更动词（nssm get/status 只读不拦）——停服不可逆，不降级
+    (re.compile(r"\b(?:net|sc(?:\.exe)?)\s+(?:start|stop|delete|create|config|pause|continue)\b", re.I), False),
+    (re.compile(r"\bnssm\b[\s\S]{0,60}?\b(?:set|install|remove|start|stop|restart|pause|continue)\b", re.I), False),
+    # 2 计划任务：创建/删除/修改；Query 不拦——不降级
+    (re.compile(r"\bschtasks\s+/(?:create|delete|change)\b", re.I), False),
+    (re.compile(r"\b(?:Register-|Unregister-|Set-)ScheduledTask\b", re.I), False),
+    # 3 杀进程（高危不可逆）；tasklist 只读不在列——不降级
+    (re.compile(r"\btaskkill\b", re.I), False),
+    # 4 注册表写入；reg query 不拦——不降级
+    (re.compile(r"\breg(?:\.exe)?\s+(?:add|delete|import|restore|load|unload)\b", re.I), False),
+    # 5 文件系统变更（POSIX 与 cmd/PowerShell 形态；须带参数，孤立词不算）——不降级
+    (re.compile(r"\b(?:rm|rmdir|del|erase|ren|unlink)\s+\S", re.I), False),
+    (re.compile(r"\b(?:mv|cp)\s+(?:-{1,2}\w+\s+)*\S+\s+\S+", re.I), False),
+    (re.compile(r"\bremove[\s_\-]*(?:item|file)\b", re.I), False),
+    # 6 安装/包管理——可降级（可重复、可回滚；`pip install x --help` 是读文档常态）
+    (re.compile(r"\b(?:winget|choco)\s+(?:install|uninstall|update|upgrade)\b", re.I), True),
+    (re.compile(r"\b(?:npm|pnpm|yarn|pip|pip3|uv|cargo)\s+(?:install|uninstall|add|remove|update)\b", re.I), True),
+    (re.compile(r"\binstall[\s_\-]*package\b", re.I), True),
+    # 7 git 写操作（提交/推送/改写工作区）；status/log/diff 只读不拦——可降级
+    (re.compile(r"\bgit\s+(?:push|commit|checkout|restore|reset|clean|merge|rebase|stash|apply|tag)\b", re.I), True),
     # 8 PowerShell 变更动词（cmdlet 形态；大写不敏感，兼容无连字符直调变体；
-    #   仅对系统对象生效——Set-Location/Get-* 类导航读取不拦）
-    re.compile(
+    #   仅对系统对象生效——Set-Location/Get-* 类导航读取不拦）；v1.1.3 补写文件/写值的
+    #   名词（Content/Csv/ItemProperty）与动词（Export），并单独兜 Out-/Tee- 系：
+    #   Set-Content / Add-Content / Set-ItemProperty / Export-Csv / Out-File / Tee-Object
+    #   此前一条都不中。刻意不含 Object 名词——New-Object 是纯内存构造，不该误伤只读脚本。
+    (re.compile(
         r"\b(?:Set|New|Remove|Stop|Restart|Install|Uninstall|Disable|Enable|Add|Clear|"
-        r"Move|Copy|Rename|Format)[\s_\-]*(?:Service|Item|File|Process|Computer|Machine|Registry|"
+        r"Move|Copy|Rename|Format|Export)[\s_\-]*(?:Service|Item|ItemProperty|File|Content|"
+        r"Csv|Process|Computer|Machine|Registry|"
         r"Package|Scheduled[A-Za-z]*|Firewall|NetAdapter|Route|Task|User|LocalUser|"
-        r"Volume|Disk|Partition|ExecutionPolicy)\b", re.I),
-    re.compile(r"\brestart[\s_\-]*computer\b", re.I),
-    # 9 wmic 变更子命令；list/get 只读不拦
-    re.compile(r"\bwmic\b[^\n]*\b(?:modify|call|create|delete)\b", re.I),
+        r"Volume|Disk|Partition|ExecutionPolicy)\b", re.I), False),
+    (re.compile(r"\b(?:Out|Tee)[\s_\-]*(?:File|Object|Csv)\b", re.I), False),
+    (re.compile(r"\brestart[\s_\-]*computer\b", re.I), False),
+    # 9 wmic 变更子命令；list/get 只读不拦——不降级
+    (re.compile(r"\bwmic\b[^\n]*\b(?:modify|call|create|delete)\b", re.I), False),
     # 10 Hermes 自身变更子命令（改本机安装/配置/注册状态）；--version、status、serve 不拦
-    re.compile(r"\bhermes\s+(?:update|install|uninstall|gateway\s+install|config\s+set"
-               r"|cron\s+(?:add|remove|edit)|skills?\s+(?:add|remove|install)"
-               r"|computer-use\s+install|vault\s+add)\b", re.I),
+    #    ——可降级（`hermes gateway install --help` 是探参数常态）
+    (re.compile(r"\bhermes\s+(?:update|install|uninstall|gateway\s+install|config\s+set"
+                r"|cron\s+(?:add|remove|edit)|skills?\s+(?:add|remove|install)"
+                r"|computer-use\s+install|vault\s+add)\b", re.I), True),
 ]
 
 # 拆段：管道/串联命令逐段检查，防 "ls && rm -rf x" 躲过首词判定。
@@ -97,9 +128,10 @@ _SUBPROC_CALL_RX = re.compile(r"\bsubprocess\.\w+\s*\(")
 _STR_LIT_RX = re.compile(r"'([^']*)'|\"([^\"]*)\"")
 
 # 探查降级：段带 --help/-h/--dry-run/? 类只读探查标志，且标志之后不再跟真实操作数
-# （只剩 2>&1 类重定向碎片）时，该段跳过黑名单——"hermes gateway install --help"
-# 这种探参数不该拦。已知代价：执意者在危险命令尾部附加 --help 可骗过降级
-# （与 EncodedCommand 同为防糊涂不防执意，README 边界）。
+# （只剩 2>&1 类重定向碎片）时，该段内的"可降级"条目免检——"hermes gateway install
+# --help" 这种探参数不该拦。v1.1.3 修：降级按条目白名单（见 _STATE_PATTERNS 第二字段），
+# 只有包安装/包管理/hermes 自身/git 写操作四类可降级；删除、杀进程、服务停止、注册表写、
+# 文件系统变更一律不可降级——旧版整段免检时 `rm -rf <path> --help` 一行即绕过闸门。
 _PROBE_FLAG_RX = re.compile(r"(?:^|\s)(?:--help|-h|--dry-run|/\?|\?)(?=\s|$)")
 _PROBE_JUNK_RX = re.compile(r"^[\d<>]")
 
@@ -117,9 +149,13 @@ def _segments(cmd: str) -> List[str]:
 
 
 def _hit_state(text: str) -> bool:
-    return any(rx.search(seg)
-               for seg in _segments(text) if not _segment_is_probe(seg)
-               for rx in _STATE_PATTERNS)
+    """段逐一比对黑名单；探参数降级只对标记"可降级"的条目生效（v1.1.3）。"""
+    for seg in _segments(text):
+        probe = _segment_is_probe(seg)
+        for rx, degradable in _STATE_PATTERNS:
+            if rx.search(seg) and not (probe and degradable):
+                return True
+    return False
 
 
 def _terminal_is_write(command: str) -> bool:
@@ -217,14 +253,37 @@ def _session_meta(session_id: str) -> tuple:
     return source, parent
 
 
+_INTERACTIVE_SOURCES = {"desktop", "local", "gui", "tui"}
+
+
 def _exempt(session_id: str) -> bool:
-    """非交互/无卡会话豁免：oneshot、cron、qqbot、子代理、以及任何非 desktop 来源。"""
+    """非交互/无卡会话豁免：cron、oneshot、qqbot、unknown、子代理。
+
+    判据用「正面白名单」而不是「不等于 desktop 就豁免」：
+    2026-10-27 起桌面端改走本地网关通道，Hermes 把会话来源记成 `local`
+    而不是 `desktop`，负面判据会让所有桌面会话被静默豁免（实测 10-27 之后
+    闸门一次都没拦过）。交互来源（desktop/local/gui/tui）一律进闸门，
+    只有确实没有确认卡 UI 的来源才豁免。
+    """
     if _env_off():
         return True
     if not session_id:
         return True  # 拿不到会话身份，不猜——放行（fail-open）
     source, parent = _session_meta(session_id)
-    return source != "desktop" or bool(parent)
+    return source not in _INTERACTIVE_SOURCES or bool(parent)
+
+
+def _is_unattended_review() -> bool:
+    """当前调用是否来自后台自我改进回顾（background review）的 fork。
+
+    复用 Hermes 自带判据 tools.skill_provenance.is_unattended_review（contextvar），
+    不另造识别逻辑。review fork 与主会话共享 session_id，_exempt 的来源判据对它无效。
+    """
+    try:
+        from tools.skill_provenance import is_unattended_review
+        return bool(is_unattended_review())
+    except Exception:
+        return False
 
 
 def _is_write(tool_name: str, args: Dict[str, Any]) -> bool:
@@ -236,6 +295,18 @@ def _is_write(tool_name: str, args: Dict[str, Any]) -> bool:
     if tool_name == "terminal":
         return _terminal_is_write(args.get("command") or "")
     return False
+
+
+def _delegate_after_approval() -> bool:
+    """「确认后自动转派子代理」开关（plugin.yaml config_schema → 桌面端 能力→插件 页）。
+
+    每次调用现读 plugins.entries.write-gate.settings.delegate_after_approval，拨动后
+    立即生效、不用重启网关。读不到/读失败一律按「关闭」处理——关闭态就是旧行为。
+    """
+    try:
+        return bool(_CTX.get_config("delegate_after_approval", False))
+    except Exception:
+        return False
 
 
 _BLOCK_MSG = (
@@ -253,6 +324,20 @@ _BLOCK_MSG = (
 )
 
 
+_DELEGATE_MSG = (
+    "[write-gate] 该写操作已获用户批准，但「确认后自动转派子代理」开关为开：本写入不由你执行。\n"
+    "请严格按以下方式处理：\n"
+    "1) 不要重试本调用，也不要改用 terminal/execute_code 或其他任何通道自己落盘；\n"
+    "2) 用 delegate_task 派一个子代理执行这次已批准的方案，brief 必须写清三段：\n"
+    "   · 允许改的绝对路径清单（一个路径一行，逐个列全）；\n"
+    "   · 禁止触碰范围：清单外的文件/目录一律不改，不顺手重构、不格式化、不动无关内容；\n"
+    "   · 回报要求：实际改了哪些文件，每个文件的最终字节数与 SHA256。\n"
+    "3) 只派一次；派发后向用户给一行状态并结束本轮，本轮不要继续尝试写入。\n"
+    "4) 子代理的回报如实转述给用户（文件、字节数、哈希），不要替它补写未核实的结果。\n"
+    "说明：子代理会话不受本闸门拦截；本轮闸门只转派这一次，之后的重试直接放行。"
+)
+
+
 def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "",
                       turn_id: str = "", **_kw) -> Optional[Dict[str, str]]:
     try:
@@ -260,13 +345,34 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "
             return None
         if not isinstance(args, dict) or _exempt(session_id):
             return None
+        # 后台回顾的 memory 写入交出控制权：它无法弹确认卡（clarify 不在其工具白名单），
+        # 拦下等于把用户画像的自动更新链路整条堵死。上游 memory_tool 的
+        # _background_delete_gate 已负责把 patch/remove 转 pending 待批、add 直接写入；
+        # 此处只放 memory，write_file / patch / terminal 仍拦。
+        if tool_name == "memory" and _is_unattended_review():
+            return None
         if not _is_write(tool_name, args):
             return None
         with _LOCK:
             u = _unlock.get(session_id)
-            if u and (u[0] == "session" or (u[0] == "turn" and u[1] and u[1] == turn_id)):
-                return None
-        return {"action": "block", "message": _BLOCK_MSG}
+            unlocked = bool(u and (u[0] == "session" or (u[0] == "turn" and u[1] and u[1] == turn_id)))
+            # 只有「按此方案执行」产生的单轮放行可转派：SESSION 级（用户说"别问了"）
+            # 保持旧行为，否则那种会话会每条消息都派一个子代理。memory 不转派：
+            # 子代理没有 memory 工具（工具层禁用），转过去必然空转。
+            redirectable = bool(
+                unlocked and u and u[0] == "turn" and u[1] == turn_id and turn_id
+                and tool_name != "memory"
+                and _redirected.get(session_id) != turn_id
+            )
+        if not unlocked:
+            return {"action": "block", "message": _BLOCK_MSG}
+        if redirectable and _delegate_after_approval():
+            with _LOCK:
+                _redirected[session_id] = turn_id
+            logger.info("write-gate: session %s redirecting approved %s to subagent (turn %s)",
+                        session_id, tool_name, turn_id)
+            return {"action": "block", "message": _DELEGATE_MSG}
+        return None
     except Exception as err:                        # fail-open
         logger.warning("write-gate pre_tool_call error (pass-through): %s", err)
         return None
@@ -310,15 +416,35 @@ def _on_post_tool_call(tool_name: str = "", result: Any = None, session_id: str 
         data = json.loads(result)
         if data.get("timed_out"):
             return
+        responses = data.get("responses") or []
+        # 只认闸门自己的确认卡：卡上选项须含「按此方案执行」。业务提问的 clarify
+        # （选项是业务选项）一律忽略——否则用户对业务问题答一句"好/可以/做"，会被
+        # 下面的语义分类判成 TURN，把整轮写入错误放行（2026-10-10 14:28 实测复现）。
+        if not any(
+            str(c).strip().startswith(APPROVE_LABEL)
+            for r in responses
+            for c in (r.get("choices_offered") or [])
+        ):
+            return
         answers = []
-        for r in (data.get("responses") or []):
+        for r in responses:
             ur = r.get("user_response", "")
             answers.append("；".join(ur) if isinstance(ur, list) else str(ur))
         joined = "\n".join(a for a in answers if a.strip()).strip()
         if not joined:
             return
+        # ① 机械匹配：答案须与「按此方案执行」精确一致，或与卡上某个以该标记开头的选项
+        # 精确一致（点选项＝选项原文回填）。v1.1.3 收紧：此前对 user_response 用
+        # startswith，用户在自定义框里"引用"选项发问（"按此方案执行是什么意思？"）也会被
+        # 机械放行整轮；卡身份识别（上面那段）仍用 startswith——闸门卡选项常带括号后缀。
+        approve_answers = {APPROVE_LABEL} | {
+            str(c).strip()
+            for r in responses
+            for c in (r.get("choices_offered") or [])
+            if str(c).strip().startswith(APPROVE_LABEL)
+        }
         with _LOCK:
-            if any(a.strip().startswith(APPROVE_LABEL) for a in answers if a.strip()):
+            if any(a.strip() in approve_answers for a in answers if a.strip()):
                 _unlock[session_id] = ("turn", turn_id)      # ① 机械匹配：本轮放行
                 logger.info("write-gate: session %s unlocked TURN %s (mechanical)", session_id, turn_id)
                 return
@@ -346,14 +472,17 @@ def _on_session_end(session_id: str = "", **_kw) -> None:
     新会话有新 session_id，天然从零锁定。"""
     with _LOCK:
         _source_cache.pop(session_id, None)
+        _redirected.pop(session_id, None)     # 转派状态按消息结束清（turn 变化亦自动失效）
 
 
 _LLM: Any = None
+_CTX: Any = None
 
 
 def register(ctx) -> None:
-    global _LLM
+    global _LLM, _CTX
     _LLM = ctx.llm
+    _CTX = ctx
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_hook("on_session_end", _on_session_end)

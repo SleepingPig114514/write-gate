@@ -2,6 +2,67 @@
 
 本仓库所有版本变更都会记录在此文件。版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.1.5] - 2026-11-22
+
+### 新增（默认关闭，关闭态行为与 1.1.4 逐字节一致）
+
+- **确认后自动转派子代理**：开关在桌面端「能力 → 插件 → write-gate」（`plugin.yaml` 的 `config_schema` → `plugins.entries.write-gate.settings.delegate_after_approval`，`ctx.get_config` 每次现读，拨动即生效、免重启）。打开后点「按此方案执行」不再让主模型重试那次写入，而是拦下并返回 `_DELEGATE_MSG`，要求用 `delegate_task` 派子代理执行，brief 必须写清允许改的绝对路径清单、禁止触碰范围、以及「改了哪些文件 + 每个文件字节数与 SHA256」的回报要求。
+  - 只对「按此方案执行」产生的单轮放行生效；`SESSION` 级（"别问了"）保持旧行为，否则那种会话会每条消息派一个子代理。
+  - `memory` 不转派：子代理没有 memory 工具（工具层禁用），转过去必然空转。
+  - 兜底不死锁：`_redirected[session_id]` 记本轮已转派，同一轮再重试直接放行；`turn_id` 变化或 `on_session_end` 时清空。
+  - 开关读不到/读失败一律按关闭处理 ⇒ 退回旧行为。
+
+### 补记（1.1.4，此前只存在于运行时副本，仓库无此提交）
+
+- **来源白名单改为正面判据**：`_exempt` 由「来源 != desktop 就豁免」改为「来源不在 `_INTERACTIVE_SOURCES`（desktop/local/gui/tui）才豁免」。2026-10-27 起桌面端会话来源记为 `local`（本机 `state.db` 实测存在 `gui`/`local` 两类），旧负向判据会让全部桌面会话被静默豁免、闸门一次都不拦。
+
+## [1.1.3] - 2026-10-16
+
+### 概述
+
+外部代码锐评（六条指控）复核后确认的**机械级漏判**修复。逐条在源码取证：4 条实锤、1 条属范围选择、1 条部分成立；另外自查出 3 条锐评没看到的同源问题（第 5 类缺 `re.I`、`_MANAGED` 覆盖只有 5 个通道、只读分析脚本会被字符串字面量误拦）。本节只改机械一致性，不扩大拦截面。
+
+### 修复
+
+- **大小写不一致**：`_STATE_PATTERNS` 17 条里第 5 类（`rm|rmdir|del|erase|ren|unlink`）与第 7 类（`git`）漏 `re.I`，而 Windows 命令不区分大小写 ⇒ `GIT PUSH`、`DEL /f x`、cmd 的 `REN`、PowerShell 别名 `RM` 全部放行。两类补齐 `re.I`。
+- **探查降级成了危险命令的免检通行证**：`_segment_is_probe` 命中 `--help/-h/--dry-run/?` 即整段跳过黑名单，`rm -rf <path> --help`（以及 `taskkill … /?`、`reg add … --help`、`net stop … -h`）一行绕过闸门。现改为**按条目标记可降级**：`_STATE_PATTERNS` 由「模式列表」改为「(正则, 可否降级)」，仅包安装/包管理/hermes 自身/git 写操作四类可降级，删除、杀进程、服务停止、注册表写、文件系统变更、wmic、PowerShell 变更动词一律不可降级。原有的"`hermes gateway install --help` 不该误伤"收益保留。
+- **`open` 写模式漏 `r+`**：字符类 `[wax][+btu]*` 不含 r 开头，`open(f,'r+')` / `'r+b'` / `'rb+'` 这类"读改"模式静默落盘。改为 `(?:[rbtu]*[wax][+btu]*|[rbtu]*\+[btu]*)`，纯只读 `r` / `rb` / `rt` 仍放行。
+- **PowerShell 写文件 cmdlet 缺席**：旧名词表里没有 `Content` / `Csv` / `ItemProperty`，动词表里没有 `Export` / `Out` / `Tee` ⇒ `Set-Content` / `Add-Content` / `Out-File` / `Tee-Object` / `Set-ItemProperty` / `Export-Csv` 一条都不拦（作者原以"文件写归 write_file/patch 管"为理由，但闸门管不住模型选哪条通道，且这些是 PowerShell 用户的默认写法，属"糊涂"不属"执意"）。现补齐，并刻意**不含 `Object` 名词**以免误伤 `New-Object` 这类纯内存构造。
+- **机械放行 `startswith` 偏宽**：用户回复此前用 `startswith(「按此方案执行」)` 判定，在确认卡里"引用"选项发问（如"按此方案执行是什么意思？"）会被机械放行整轮。收紧为"与标记精确一致，或与卡上某个以标记开头的选项精确一致（点选项＝选项原文回填）"；卡身份识别仍用 `startswith`（闸门卡选项常带括号后缀，用精确匹配会静默丢卡）。
+
+### 已知边界补充（README 同步）
+
+- 内联解释器写盘不拦：`python -c "open(...,'w')"`、`node -e`、`sed -i`、`dd of=`；
+- 闸门只覆盖 5 个通道 + 子会话整类豁免 ⇒ 外包给子代理可绕过（与 EncodedCommand 同一边界）；
+- 只读分析脚本可能被字符串字面量误拦（判定走源码文本正则，非 AST）；
+- 可降级类目仍可被"变更命令 + `--help`"骗过（CLI 遇 `--help` 先退栈，属可接受代价）。
+
+### 残余盲区（如实，不解决）
+
+- `import hermes_tools as ht` 别名导入（v1.1.2 起列为盲区，本版未动）；
+- `powershell -EncodedCommand` / `cmd /c "<嵌套>"` 载荷不可见（v1.1.0 起）；
+- 跨平台命令（`systemctl` / `apt` / `brew` / `launchctl`）不在名单——目标平台是 Windows，属范围选择而非言行不一（`wsl rm -rf …` 仍会被第 5 类命中）。
+
+### 验收
+
+`scripts/test_gate.py` 由 78 条扩到 **96 条断言，失败 0**（新增：大小写 4 条、尾挂 `--help`/`/?` 反例 4 条、PowerShell 写文件 5 条、`open r+` 系 3 条、只读模式护栏 2 条、探参数正例 4 条、机械放行收紧 2 条）。`EncodedCommand` 盲区样本仍单独打印、不作通过断言。
+
+## [1.1.2] - 2026-10-10
+
+### 修复（两处真实漏判，均由用户实机会话实测暴露）
+
+- **clarify 判定范围外延**：`_on_post_tool_call` 此前对**任何** `clarify` 的回答做同意判定，不看这张卡是不是闸门自己发的确认卡。后果：用户对一次普通业务提问答"好 / 可以 / 做"，会被语义分类判成 TURN，把整轮写入错误放行（2026-10-10 14:28 实测：一次"要不要做测试"的提问答"做，测一下…"，整轮解锁）。现加选项过滤——仅当卡上 `choices_offered` 含「按此方案执行」才处理；业务提问的回答零分类、零影响。
+- **`execute_code` 经 `hermes_tools` 绕过闸门**：`from hermes_tools import write_file / patch / terminal` 在 execute_code 内直接落盘，不经过工具层 `pre_tool_call` 钩子；旧 `_WRITE_PATTERNS` 只认 `open(…,'w')` / `shutil` / `os.` / `.write_text` 等形态，一条都不命中，该通道完全漏管（2026-10-10 实测：锁定态下 execute_code 内 write_file 写盘成功，而同一轮直接 write_file 被拦）。现补两条静态模式捕获直接调用形态。
+
+### 残余盲区（如实，不解决）
+
+- `import hermes_tools as ht` 别名导入仍可绕过静态检测——同为"防糊涂不防执意"边界
+- 业务 clarify 若把选项原文写成含「按此方案执行」字样，仍会被认作闸门卡（与出卡契约一致，代价可控）
+
+### 验收
+
+`scripts/test_gate.py` 新增 4 条断言 + 3 类拦截样本：业务卡回答"好"→零分类且不解锁；hermes_tools 导入 write_file / 属性 patch / 导入 terminal 三种形态必拦；hermes_tools 只读助手（read_file / search_files）必放。
+
 ## [1.1.1] - 2026-10-07
 
 ### 变更

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""write-gate v1.1.0 离线验收：黑名单必拦 + 只读必放 + subprocess 注入必拦 + 解锁回归。
+"""write-gate v1.1.3 离线验收：黑名单必拦 + 只读必放 + subprocess 注入必拦 + 解锁回归。
 
 样本来源：2026-10-07 HermesSrv8119 修复会话的真实调用串，及近 7 天 terminal 高频命令。
 EncodedCommand 盲区样本单独列出、不作通过断言（README 已知边界）。
@@ -43,6 +43,22 @@ TERM_BLOCK = [
     ("管道后段变更", "echo hi | taskkill /F /PID 123"),
     ("PowerShell 全树杀", "Get-Process mmc | Stop-Process -Force"),
     ("任务计划注册", "Register-ScheduledTask -TaskName X -Action $a"),
+    # v1.1.3：大小写一致性（Windows 命令不区分大小写；旧版第 5 类与 git 类漏 re.I）
+    ("git 全大写", "GIT PUSH origin main"),
+    ("cmd 大写 DEL", "DEL /f C:\\tmp\\x"),
+    ("cmd 大写 REN", "REN a.txt b.txt"),
+    ("PS 别名大写 RM", 'powershell -NoProfile -Command "RM C:\\tmp\\x"'),
+    # v1.1.3：探查降级不再当危险命令的免检通行证
+    ("删除尾挂 --help", "rm -rf D:\\tmp\\junk --help"),
+    ("杀进程尾挂 /?", "taskkill /F /IM hermes.exe /?"),
+    ("注册表写尾挂 --help", "reg add HKCU\\Software\\Foo /v x /d y --help"),
+    ("停服务尾挂 -h", "net stop HermesSrv8119 -h"),
+    # v1.1.3：PowerShell 写文件/写值 cmdlet（旧名词表里一条都不中）
+    ("Set-Content", 'powershell -NoProfile -Command "Set-Content -Path a.txt -Value x"'),
+    ("Out-File", 'powershell -NoProfile -Command "Get-Date | Out-File a.txt"'),
+    ("Add-Content", 'powershell -NoProfile -Command "Add-Content a.txt x"'),
+    ("Tee-Object", 'powershell -NoProfile -Command "Get-Process | Tee-Object -FilePath a.txt"'),
+    ("Set-ItemProperty", 'powershell -NoProfile -Command "Set-ItemProperty -Path HKCU:\\X -Name y -Value 1"'),
 ]
 
 # ── terminal：必须放（近 7 天真实只读形态）─────────────────────────
@@ -70,6 +86,11 @@ TERM_PASS = [
     ("只读 PS", "powershell -NoProfile -Command \"Test-Path C:\\Users\\12; Get-Item C:\\x | Select-Object Length\""),
     ("变更命令探参数（回放误伤修复）", "hermes gateway install --help 2>&1 || true"),
     ("包安装探参数", "pip install requests --help"),
+    # v1.1.3：可降级类目的探参数仍免检；只读脚本不得被新名词表误伤
+    ("git 写操作探参数", "git commit --help"),
+    ("PS 只读构造对象", 'powershell -NoProfile -Command "$o = New-Object PSObject"'),
+    ("PS 读文件", 'powershell -NoProfile -Command "Get-Content a.txt"'),
+    ("大小写只读", "TaskList /FO CSV"),
 ]
 
 # ── terminal：必须拦（探查降级不可被骗——标志后面还有真实操作数/前段有变更）──
@@ -87,6 +108,14 @@ EXEC_BLOCK = [
     ("subprocess shell taskkill", "import subprocess\nsubprocess.run('taskkill /F /PID 123', shell=True)"),
     ("subprocess 装包", "import subprocess\nsubprocess.run(['pip', 'install', 'requests'])"),
     ("subprocess net start", "import subprocess\nsubprocess.run('net start HermesSrv8119', shell=True)"),
+    # v1.1.2：hermes_tools 程序化写助手（不经过工具层 pre_tool_call 钩子，2026-10-10 实测绕过）
+    ("hermes_tools 导入 write_file", "from hermes_tools import write_file\nprint(write_file('a.txt', 'x'))"),
+    ("hermes_tools 属性 patch", "import hermes_tools\nhermes_tools.patch('a.txt', 'old', 'new')"),
+    ("hermes_tools 导入 terminal", "from hermes_tools import terminal\nterminal('rm -rf x')"),
+    # v1.1.3：可写的"读改"模式（旧字符类 [wax] 漏判）
+    ("open r+ 读改模式", "f = open('a.txt', 'r+')"),
+    ("open r+b 读改模式", "f = open('a.txt', 'r+b')"),
+    ("open rb+ 变体顺序", "f = open('a.txt', 'rb+')"),
 ]
 
 # ── execute_code：必须放（只读分析形态）────────────────────────────
@@ -98,12 +127,20 @@ EXEC_PASS = [
     ("read 模式", "data = open('in.txt').read()\nprint(data)"),
     ("hashlib", "import hashlib\nprint(hashlib.sha256(b'x').hexdigest())"),
     ("sqlite 只读", "import sqlite3\ncon = sqlite3.connect('file:x.db?mode=ro', uri=True)\nprint(con.execute('select 1').fetchone())"),
+    # v1.1.2：hermes_tools 只读助手不受影响
+    ("hermes_tools 只读 read_file", "from hermes_tools import read_file\nprint(read_file('a.txt'))"),
+    ("hermes_tools 只读 search_files", "from hermes_tools import search_files\nprint(search_files('x'))"),
+    # v1.1.3：只读模式不得被写模式扩展误伤
+    ("open r 显式只读", "data = open('in.txt', 'r').read()\nprint(data)"),
+    ("open rb 只读二进制", "data = open('in.bin', 'rb').read()\nprint(data)"),
 ]
 
 fails = 0
+total = 0
 
 def check(label, got, want):
-    global fails
+    global fails, total
+    total += 1
     if got != want:
         fails += 1
         print(f"FAIL {label}: want={'block' if want else 'pass'} got={'block' if got else 'pass'}")
@@ -147,14 +184,14 @@ class _FakeLLM:
 wg._LLM = _FakeLLM()
 wg._exempt = lambda sid: False
 
-def _clarify_result(resp):
+def _clarify_result(resp, choices=None):
     return _json.dumps({"responses": [{"question": "q", "user_response": resp,
-                                        "choices_offered": ["按此方案执行", "取消"], "status": "answered"}]})
+                                        "choices_offered": choices or ["按此方案执行", "取消"], "status": "answered"}]})
 
-def _post(resp, sid, tid):
+def _post(resp, sid, tid, choices=None):
     _calls.clear()
     with contextlib.redirect_stdout(io.StringIO()):
-        wg._on_post_tool_call("clarify", _clarify_result(resp), sid, tid)
+        wg._on_post_tool_call("clarify", _clarify_result(resp, choices), sid, tid)
     return len(_calls)
 
 s, t1 = "s-v111", "t-1"
@@ -170,5 +207,28 @@ s3, t3 = "s-v111c", "t-3"
 n = _post("先把X改成Y再做", s3, t3)
 check("free-text-one-classify", (n == 1 and _calls and _calls[0].get("task") == "approval"), True)
 
-print(f"\n断言总数: {len(TERM_BLOCK)+len(TERM_BLOCK_PROBE_TRICK)+len(TERM_PASS)+len(EXEC_BLOCK)+len(EXEC_PASS)+4+3}, 失败: {fails}")
+# ── v1.1.2：业务提问的 clarify 不得开闸（选项不含「按此方案执行」）────
+s4, t4 = "s-v112-biz", "t-4"
+n = _post("好，就这样", s4, t4, choices=["写入直接成功，我没见过卡", "见过卡但还被拦"])
+check("biz-card-no-unlock-no-classify", (n == 0 and s4 not in wg._unlock), True)
+
+# ── v1.1.3：机械放行收紧为精确匹配 ───────────────────────────────
+class _NoLLM:
+    def complete_structured(self, **kw):
+        _calls.append(kw)
+        class R: parsed = {"switch": "NO"}
+        return R()
+
+wg._LLM = _NoLLM()
+# ④ 卡内"引用"选项发问：不得再走机械放行（旧版 startswith 会直接开闸）
+s5, t5 = "s-v113-quote", "t-5"
+n = _post("按此方案执行是什么意思？", s5, t5)
+check("quote-question-not-mech-unlock", (n == 1 and s5 not in wg._unlock), True)
+# ⑤ 点带括号后缀的闸门卡选项：仍须机械放行、零分类（收紧不得误伤正常点击）
+s6, t6 = "s-v113-paren", "t-6"
+n = _post("按此方案执行（重写操作卡模板）", s6, t6,
+          choices=["按此方案执行（重写操作卡模板）", "取消"])
+check("paren-option-click-still-unlocks", (n == 0 and wg._unlock.get(s6, (None,))[0] == "turn"), True)
+
+print(f"\n断言总数: {total}, 失败: {fails}")
 sys.exit(1 if fails else 0)
