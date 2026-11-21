@@ -8,7 +8,7 @@
   · 所有会话：设置→插件 页拨 write-gate 开关。
   · 转派子代理（默认关，「能力→插件」页开关）：打开后点「按此方案执行」不再由主模型
     重试写入，而是拦下本次调用、由模型派 delegate_task 执行；同一轮再次重试则直接放行
-    （宁可退化不死锁）。
+    （宁可退化不死锁）。改动行数低于 settings.delegate_min_lines 时直写、不转派。
 不判定路径、不设时间窗、不维护白名单——范围与计划是模型和用户之间的事。
 
 拦截 write_file / patch / memory / execute_code(代码含写模式或状态变更) /
@@ -47,6 +47,9 @@ _source_cache: Dict[str, tuple] = {}         # session_id -> (source, parent, ts
 # session_id -> turn_id：本轮已把「已批准的写入」导向 delegate_task 一次。
 # 只认当前 turn（turn 变了自然失效）；命中即放行 = 兜底，宁可退化不肯死锁。
 _redirected: Dict[str, str] = {}
+_cwd_cache: Dict[str, tuple] = {}            # session_id -> (cwd, ts)  相对路径解析用
+_changed_acc: Dict[str, tuple] = {}          # session_id -> (turn_id, 本轮累计改动行数)
+_READ_LIMIT = 2 * 1024 * 1024                # 算真实改动量时最多读这么多字节，超了按全文行数
 
 # execute_code 文件写模式：命中任一即视为写操作。防糊涂不防执意（README 有言在先）。
 _WRITE_PATTERNS = [
@@ -309,6 +312,94 @@ def _delegate_after_approval() -> bool:
         return False
 
 
+def _delegate_min_lines() -> int:
+    """低于这个改动行数就直接写入、不转派；0 = 不设阈值（全部转派，v1.1.5 行为）。"""
+    try:
+        return max(0, int(_CTX.get_config("delegate_min_lines", 0) or 0))
+    except Exception:
+        return 0
+
+
+def _session_cwd(session_id: str) -> str:
+    """查 state.db 取会话工作目录（相对路径解析用），缓存 60s；拿不到返回 ""。"""
+    cached = _cwd_cache.get(session_id)
+    if cached and _now() - cached[1] < 60:
+        return cached[0]
+    cwd = ""
+    try:
+        from hermes_constants import get_hermes_home
+        db = str(get_hermes_home() / "state.db")
+        import sqlite3
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1.0)
+        try:
+            row = con.execute("SELECT cwd FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if row and row[0]:
+                cwd = str(row[0])
+        finally:
+            con.close()
+    except Exception:
+        pass  # 查不到就当没有 cwd：相对路径回退到按全文行数算
+    _cwd_cache[session_id] = (cwd, _now())
+    return cwd
+
+
+def _changed_lines(tool_name: str, args: Dict[str, Any], session_id: str = "") -> Optional[int]:
+    """估算本次写入改动了多少行。None = 估不出（terminal / execute_code / 形态不明）。
+
+    patch：new_string 的行数。
+    write_file：目标存在且 <= _READ_LIMIT 时用 SequenceMatcher 比真实改动量（改 1 行 = 1）；
+    相对路径先按会话 cwd 解析；读不到就退回 content 的全文行数。
+    """
+    try:
+        if tool_name == "patch":
+            new = args.get("new_string")
+            if not isinstance(new, str) or new == "":
+                return None          # V4A 多文件形态等：本次改多少无从判断
+            return max(1, len(new.splitlines()))
+        if tool_name != "write_file":
+            return None
+        content = args.get("content")
+        if not isinstance(content, str):
+            return None
+        path = str(args.get("path") or "")
+        if path and not os.path.isabs(path) and session_id:
+            cwd = _session_cwd(session_id)
+            if cwd:
+                path = os.path.join(cwd, path)
+        if path and os.path.isabs(path) and os.path.isfile(path) \
+                and os.path.getsize(path) <= _READ_LIMIT:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                old = f.read()
+            import difflib
+            sm = difflib.SequenceMatcher(None, old.splitlines(), content.splitlines(), autojunk=False)
+            return sum(max(i2 - i1, j2 - j1) for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != "equal")
+        return len(content.splitlines())
+    except Exception:
+        return None
+
+
+def _accumulated_below_threshold(tool_name: str, args: Dict[str, Any],
+                                 session_id: str = "", turn_id: str = "") -> bool:
+    """把本次改动累计进本轮，累计值仍低于 delegate_min_lines 才直写。
+
+    同轮多次写入会累加：零碎改 5 个文件、每次 15 行，第 2 次就越线转派（已落盘的
+    前几次不回收）。估不出行数 / 未设阈值 / 已超线 → False（转派）。换 turn 自动清零。
+    """
+    limit = _delegate_min_lines()
+    if limit <= 0:
+        return False
+    lines = _changed_lines(tool_name, args, session_id)
+    if lines is None:
+        return False
+    with _LOCK:
+        prev_turn, acc = _changed_acc.get(session_id, (turn_id, 0))
+        if prev_turn != turn_id:
+            acc = 0
+        acc += lines
+        _changed_acc[session_id] = (turn_id, acc)
+    return acc < limit
+
+
 _BLOCK_MSG = (
     "[write-gate] 该写操作/命令未获用户确认，已被拦下（文件/记忆/系统状态未发生任何变化）。\n"
     "请严格按以下流程处理：\n"
@@ -330,10 +421,13 @@ _DELEGATE_MSG = (
     "1) 不要重试本调用，也不要改用 terminal/execute_code 或其他任何通道自己落盘；\n"
     "2) 用 delegate_task 派一个子代理执行这次已批准的方案，brief 必须写清三段：\n"
     "   · 允许改的绝对路径清单（一个路径一行，逐个列全）；\n"
-    "   · 禁止触碰范围：清单外的文件/目录一律不改，不顺手重构、不格式化、不动无关内容；\n"
+    "   · 禁止触碰范围：清单外的文件/目录一律不改，临时文件只写 TMPDIR 并收尾删除，不顺手重构、不格式化、不动无关内容；\n"
     "   · 回报要求：实际改了哪些文件，每个文件的最终字节数与 SHA256。\n"
     "3) 只派一次；派发后向用户给一行状态并结束本轮，本轮不要继续尝试写入。\n"
     "4) 子代理的回报如实转述给用户（文件、字节数、哈希），不要替它补写未核实的结果。\n"
+    "5) 派发前用 delegate_task(action='list') 核对仍在跑的子代理：同一文件上双方都只读 → 直接并行；\n"
+    "   任一方要写 → 在 brief 里写明该文件正由谁使用，并指定一个可判定的写完信号（末行标记 / 旁边的 .done 文件 / 大小连续两次检查不变），确认信号后再采用读到的内容，\n"
+    "   等不到就先做其余部分。\n"
     "说明：子代理会话不受本闸门拦截；本轮闸门只转派这一次，之后的重试直接放行。"
 )
 
@@ -366,7 +460,8 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "
             )
         if not unlocked:
             return {"action": "block", "message": _BLOCK_MSG}
-        if redirectable and _delegate_after_approval():
+        if redirectable and _delegate_after_approval() and not _accumulated_below_threshold(
+                tool_name, args, session_id, turn_id):
             with _LOCK:
                 _redirected[session_id] = turn_id
             logger.info("write-gate: session %s redirecting approved %s to subagent (turn %s)",
@@ -473,6 +568,8 @@ def _on_session_end(session_id: str = "", **_kw) -> None:
     with _LOCK:
         _source_cache.pop(session_id, None)
         _redirected.pop(session_id, None)     # 转派状态按消息结束清（turn 变化亦自动失效）
+        _cwd_cache.pop(session_id, None)
+        _changed_acc.pop(session_id, None)    # 本轮累计值同样不跨消息保留
 
 
 _LLM: Any = None

@@ -230,5 +230,103 @@ n = _post("按此方案执行（重写操作卡模板）", s6, t6,
           choices=["按此方案执行（重写操作卡模板）", "取消"])
 check("paren-option-click-still-unlocks", (n == 0 and wg._unlock.get(s6, (None,))[0] == "turn"), True)
 
+# ── v1.1.6：改动行数阈值 + 第 5 条并发占用 ─────────────────────
+import tempfile
+
+class _Cfg:
+    def __init__(self, sw=True, lines=0):
+        self.sw, self.lines = sw, lines
+    def get_config(self, k, d=None):
+        return {"delegate_after_approval": self.sw, "delegate_min_lines": self.lines}.get(k, d)
+
+wg._exempt = lambda sid: False
+
+def _pre(tool, args, sid, tid):
+    return wg._on_pre_tool_call(tool_name=tool, args=args, session_id=sid, turn_id=tid)
+
+def _arm(sw, lines, sid="s-thr", tid="t-thr"):
+    wg._CTX = _Cfg(sw, lines)
+    wg._unlock.clear(); wg._redirected.clear(); wg._cwd_cache.clear(); wg._changed_acc.clear()
+    wg._unlock[sid] = ("turn", tid)
+    return sid, tid
+
+D = wg._DELEGATE_MSG
+one_line_patch = {"path": "x.py", "old_string": "a\n", "new_string": "b\n"}
+many_line_patch = {"path": "x.py", "old_string": "a\n", "new_string": "".join("L%d\n" % i for i in range(12))}
+
+s, t_ = _arm(True, 10)
+check("thr-patch-1line-direct", _pre("patch", one_line_patch, s, t_) is None, True)
+
+s, t_ = _arm(True, 10)
+check("thr-patch-12lines-delegate", _pre("patch", many_line_patch, s, t_) == {"action": "block", "message": D}, True)
+
+s, t_ = _arm(True, 0)
+check("thr-zero-means-all-delegate", _pre("patch", one_line_patch, s, t_) == {"action": "block", "message": D}, True)
+
+s, t_ = _arm(True, 10)
+check("thr-writefile-new-small-direct",
+      _pre("write_file", {"path": "C:/__wg_no_such__/n.txt", "content": "a\nb\nc\n"}, s, t_) is None, True)
+
+s, t_ = _arm(True, 10)
+check("thr-terminal-unknown-delegate",
+      _pre("terminal", {"command": "git push origin main"}, s, t_) == {"action": "block", "message": D}, True)
+
+s, t_ = _arm(True, 10)
+check("thr-exec-unknown-delegate",
+      _pre("execute_code", {"code": "from hermes_tools import write_file\nwrite_file(p, c)"}, s, t_)
+      == {"action": "block", "message": D}, True)
+
+s, t_ = _arm(True, 10)
+check("thr-patch-no-new-string-delegate",
+      _pre("patch", {"path": "x.py", "mode": "patch", "input": "*** Begin Patch"}, s, t_)
+      == {"action": "block", "message": D}, True)
+
+with tempfile.TemporaryDirectory() as td:
+    fp = os.path.join(td, "big.txt")
+    base = ["line %d" % i for i in range(100)]
+    with open(fp, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(base) + "\n")
+    one = list(base); one[50] = "line 50 CHANGED"
+    s, t_ = _arm(True, 10)
+    check("thr-writefile-abs-1line-direct",
+          _pre("write_file", {"path": fp, "content": "\n".join(one) + "\n"}, s, t_) is None, True)
+    many = ["new %d" % i for i in range(20)] + base[20:]
+    s, t_ = _arm(True, 10)
+    check("thr-writefile-abs-20lines-delegate",
+          _pre("write_file", {"path": fp, "content": "\n".join(many) + "\n"}, s, t_)
+          == {"action": "block", "message": D}, True)
+    s, t_ = _arm(True, 10)
+    wg._cwd_cache[s] = (td, wg._now())
+    check("thr-writefile-relative-cwd-1line-direct",
+          _pre("write_file", {"path": "big.txt", "content": "\n".join(one) + "\n"}, s, t_) is None, True)
+
+s, t_ = _arm(True, 10)
+check("thr-memory-never-delegates", _pre("memory", {}, s, t_) is None, True)
+s, t_ = _arm(True, 10)
+wg._unlock[s] = ("session", t_)
+check("thr-session-scope-never-delegates", _pre("patch", one_line_patch, s, t_) is None, True)
+
+s, t_ = _arm(True, 10)
+_pre("patch", many_line_patch, s, t_)
+check("thr-fallback-second-attempt-passes", _pre("patch", many_line_patch, s, t_) is None, True)
+
+# 按轮累计（v1.1.7）：同轮 12+12 ≥ 20 → 第二次转派；换 turn 清零后仍直写
+s, t_ = _arm(True, 20)
+r1 = _pre("patch", many_line_patch, s, t_)
+r2 = _pre("patch", many_line_patch, s, t_)
+check("acc-second-call-delegates", (r1 is None and r2 == {"action": "block", "message": D}), True)
+
+s, t_ = _arm(True, 20)
+_pre("patch", many_line_patch, s, t_)
+wg._changed_acc[s] = ("other-turn", 12)
+check("acc-resets-on-new-turn", _pre("patch", many_line_patch, s, t_) is None, True)
+
+check("msg-item5-concurrency-clause",
+      ("delegate_task(action='list')" in D and "双方都只读 → 直接并行" in D
+       and "可判定的写完信号" in D and "确认信号后再采用读到的内容" in D
+       and "临时文件只写 TMPDIR" in D), True)
+check("msg-items-1to4-intact",
+      ("1) 不要重试本调用" in D and "4) 子代理的回报如实转述" in D), True)
+
 print(f"\n断言总数: {total}, 失败: {fails}")
 sys.exit(1 if fails else 0)
