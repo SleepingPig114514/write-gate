@@ -348,11 +348,14 @@ check("thr-exactly-at-limit-direct", _pre("patch", exact20, s, t_) is None, True
 s, t_ = _arm(True, 20)
 check("thr-one-over-limit-delegates", _pre("patch", over21, s, t_) == {"action": "block", "message": D}, True)
 
-check("msg-item5-concurrency-clause",
-      ("delegate_task(action='list')" in D and "文件不重合的独立新活 → 新派" in D
-       and "改动文件与它手上的重合" in D and "拿不准就 steer" in D
-       and "不要让它 sleep 或轮询" in D
-       and "临时文件只写 TMPDIR" in D), True)
+check("msg-item2-delegate-or-steer",
+      ("按第 5 条的执行顺序" in D
+       and "临时文件只写 TMPDIR" in D and "回报要求：实际改了哪些文件" in D), True)
+check("msg-item5-execution-order",
+      ("执行顺序（照做，不跳步）" in D and "先 delegate_task(action='list')" in D
+       and "在它正在改的文件里" in D and "继续 steer，一条一条加完再往下走" in D
+       and "没有可追加的子代理 → 新派一次" in D and "逐条对上" in D
+       and "不要让它 sleep 或轮询" in D), True)
 check("msg-items-1to4-intact",
       ("1) 不要重试本调用" in D and "4) 子代理的回报如实转述" in D), True)
 
