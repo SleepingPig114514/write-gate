@@ -321,6 +321,16 @@ _pre("patch", many_line_patch, s, t_)
 wg._changed_acc[s] = ("other-turn", 12)
 check("acc-resets-on-new-turn", _pre("patch", many_line_patch, s, t_) is None, True)
 
+# 纯删除也算改动量：删 1 行直写、删 25 行转派（v1.1.7 修）
+del1 = {"path": "x.py", "old_string": "abc", "new_string": ""}
+del25 = {"path": "x.py", "old_string": "".join("D%d" % i + chr(10) for i in range(25)), "new_string": ""}
+
+s, t_ = _arm(True, 20)
+check("del-1line-direct", _pre("patch", del1, s, t_) is None, True)
+
+s, t_ = _arm(True, 20)
+check("del-25lines-delegate", _pre("patch", del25, s, t_) == {"action": "block", "message": D}, True)
+
 check("msg-item5-concurrency-clause",
       ("delegate_task(action='list')" in D and "双方都只读 → 直接并行" in D
        and "可判定的写完信号" in D and "确认信号后再采用读到的内容" in D

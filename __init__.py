@@ -352,9 +352,15 @@ def _changed_lines(tool_name: str, args: Dict[str, Any], session_id: str = "") -
     """
     try:
         if tool_name == "patch":
+            if "new_string" not in args:
+                return None          # V4A 多文件形态等：连键都没有，本次改多少无从判断
             new = args.get("new_string")
-            if not isinstance(new, str) or new == "":
-                return None          # V4A 多文件形态等：本次改多少无从判断
+            if not isinstance(new, str):
+                return None
+            if new == "":
+                # 纯删除：改动量 = 被删掉的行数（旧版把空串当"估不出"，删 1 行也会被转派）
+                old = args.get("old_string")
+                return max(1, len(old.splitlines())) if isinstance(old, str) and old else None
             return max(1, len(new.splitlines()))
         if tool_name != "write_file":
             return None
