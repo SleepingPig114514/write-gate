@@ -331,6 +331,16 @@ check("del-1line-direct", _pre("patch", del1, s, t_) is None, True)
 s, t_ = _arm(True, 20)
 check("del-25lines-delegate", _pre("patch", del25, s, t_) == {"action": "block", "message": D}, True)
 
+# 阈值边界：不超过阈值就直写（等于也直写），多 1 行才转派
+exact20 = {"path": "x.py", "old_string": "a", "new_string": "".join("E%d" % i + chr(10) for i in range(20))}
+over21 = {"path": "x.py", "old_string": "a", "new_string": "".join("F%d" % i + chr(10) for i in range(21))}
+
+s, t_ = _arm(True, 20)
+check("thr-exactly-at-limit-direct", _pre("patch", exact20, s, t_) is None, True)
+
+s, t_ = _arm(True, 20)
+check("thr-one-over-limit-delegates", _pre("patch", over21, s, t_) == {"action": "block", "message": D}, True)
+
 check("msg-item5-concurrency-clause",
       ("delegate_task(action='list')" in D and "双方都只读 → 直接并行" in D
        and "可判定的写完信号" in D and "确认信号后再采用读到的内容" in D

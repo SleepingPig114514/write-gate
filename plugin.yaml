@@ -15,5 +15,5 @@ config_schema:
   delegate_min_lines:
     type: int
     label: "转派行数阈值"
-    description: "改动行数低于此值直接写入、不派子代理（同轮多次写入会累加，累计越线后转派当次调用）；0 = 不设阈值（全部转派）。patch 按 new_string 行数，write_file 按真实改动量（≤2 MB 且能读到原文件时），execute_code/terminal 估不出始终转派"
+    description: "改动行数不超过此值直接写入、不派子代理（等于阈值也直写；同轮多次写入会累加，累计越线后转派当次调用）；0 = 不设阈值（全部转派）。patch 按 new_string 行数，write_file 按真实改动量（≤2 MB 且能读到原文件时），execute_code/terminal 估不出始终转派"
     default: 0

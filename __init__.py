@@ -386,7 +386,7 @@ def _changed_lines(tool_name: str, args: Dict[str, Any], session_id: str = "") -
 
 def _accumulated_below_threshold(tool_name: str, args: Dict[str, Any],
                                  session_id: str = "", turn_id: str = "") -> bool:
-    """把本次改动累计进本轮，累计值仍低于 delegate_min_lines 才直写。
+    """把本次改动累计进本轮，累计值不超过 delegate_min_lines 才直写（等于阈值也直写）。
 
     同轮多次写入会累加：零碎改 5 个文件、每次 15 行，第 2 次就越线转派（已落盘的
     前几次不回收）。估不出行数 / 未设阈值 / 已超线 → False（转派）。换 turn 自动清零。
@@ -403,7 +403,7 @@ def _accumulated_below_threshold(tool_name: str, args: Dict[str, Any],
             acc = 0
         acc += lines
         _changed_acc[session_id] = (turn_id, acc)
-    return acc < limit
+    return acc <= limit
 
 
 _BLOCK_MSG = (
