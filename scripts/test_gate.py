@@ -315,7 +315,7 @@ check("thr-retry-same-turn-still-delegates",
 s, t_ = _arm(True, 10)
 _pre("patch", many_line_patch, s, t_)
 check("thr-new-turn-relocks",
-      _pre("patch", many_line_patch, s, "t-next") == {"action": "block", "message": wg._BLOCK_MSG}, True)
+      _pre("patch", many_line_patch, s, "t-next") == {"action": "block", "message": wg._block_msg()}, True)
 
 # 按轮累计（v1.1.7）：同轮 12+12 ≥ 20 → 第二次转派；换 turn 清零后仍直写
 s, t_ = _arm(True, 20)
@@ -356,8 +356,37 @@ check("msg-item5-execution-order",
        and "在它正在改的文件里" in D and "继续 steer，一条一条加完再往下走" in D
        and "没有可追加的子代理 → 新派一次" in D and "逐条对上" in D
        and "不要让它 sleep 或轮询" in D), True)
+check("msg-item6-batch-declaration",
+      ("不要逐笔试探" in D and "一次交给同一个子代理做完" in D
+       and "那几笔不回收" in D), True)
+
+# 锁定文案：开关关时与旧版逐字节一致；开时追加「整批申报」提示且只一次
+wg._CTX = _Cfg(False, 0)
+check("blk-off-byte-identical", wg._block_msg() == wg._BLOCK_MSG, True)
+wg._CTX = _Cfg(True, 30)
+check("blk-on-has-batch-hint", "整批写进方案一起确认" in wg._block_msg(), True)
+check("blk-on-hint-once", wg._block_msg().count("整批写进方案一起确认"), 1)
+
 check("msg-items-1to4-intact",
       ("1) 不要重试本调用" in D and "4) 子代理的回报如实转述" in D), True)
+
+# delegate_task 也受闸门管：未确认就拦，已确认（单轮或会话级）则放行且不再转派
+M = wg._DISPATCH_MSG
+wg._CTX = _Cfg(True, 30)
+wg._unlock.clear(); wg._redirected.clear(); wg._changed_acc.clear()
+check("dsp-blocked-when-locked",
+      _pre("delegate_task", {"tasks": [{"goal": "x"}]}, "s-dsp", "t-dsp") == {"action": "block", "message": M}, True)
+
+s, t_ = _arm(True, 30, sid="s-dsp", tid="t-dsp")
+check("dsp-passes-when-unlocked",
+      _pre("delegate_task", {"tasks": [{"goal": "x"}]}, s, t_) is None, True)
+check("dsp-steer-passes-too",
+      _pre("delegate_task", {"action": "steer", "subagent_id": "sa-0-x"}, s, t_) is None, True)
+
+s, t_ = _arm(True, 30, sid="s-dsp", tid="t-dsp")
+wg._unlock[s] = ("session", t_)
+check("dsp-session-scope-passes",
+      _pre("delegate_task", {"tasks": [{"goal": "x"}]}, s, t_) is None, True)
 
 print(f"\n断言总数: {total}, 失败: {fails}")
 sys.exit(1 if fails else 0)

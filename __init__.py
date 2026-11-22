@@ -38,7 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 APPROVE_LABEL = "按此方案执行"
-_MANAGED = ("write_file", "patch", "memory", "execute_code", "terminal")
+_MANAGED = ("write_file", "patch", "memory", "execute_code", "terminal", "delegate_task")
 
 _LOCK = threading.Lock()
 # session_id -> (scope, turn_id)；scope ∈ {"turn","session"}
@@ -436,6 +436,36 @@ _BLOCK_MSG = (
 )
 
 
+_DISPATCH_MSG = (
+    "[write-gate] 派子代理（delegate_task）属于状态变更，需要用户确认后才执行。\n"
+    "请按以下方式处理：\n"
+    "1) 把这批活要做什么、允许改的绝对路径清单写进方案，先在回复正文呈现；\n"
+    "2) 调用 clarify 出执行确认卡，选项「按此方案执行」与「取消」；\n"
+    "3) 用户批准后本轮再调用 delegate_task 即放行（含后续 action='steer'），本轮不再问第二次。\n"
+    "说明：子代理会话本身不受本闸门拦截，所以派发这一步就是唯一的确认点。"
+)
+
+
+_BLOCK_TAIL = (
+    "若这批活要改多个文件、或明显超过阈值：不要逐笔试探，把整批写进方案一起确认，\n"
+    "批准后一次派子代理做完整批。"
+)
+
+
+def _block_msg() -> str:
+    """锁定时返回的拦截文案。
+
+    开关开时追加「整批申报」提示——批次被切开发生在第一次被拦这一刻，提示必须
+    在这里出现，写在 _DELEGATE_MSG（转派之后）已经太晚。开关关时与旧版逐字节一致。
+    """
+    try:
+        if _delegate_after_approval():
+            return _BLOCK_MSG + _BLOCK_TAIL
+    except Exception:
+        pass
+    return _BLOCK_MSG
+
+
 _DELEGATE_MSG = (
     "[write-gate] 该写操作已获用户批准，但「确认后自动转派子代理」开关为开：本写入不由你执行。\n"
     "请严格按以下方式处理：\n"
@@ -455,6 +485,8 @@ _DELEGATE_MSG = (
     "   追加多个任务时，每条 steer 开头写「做完你手上这件，接着做……」。\n"
     "   要读它正在写的文件，等它回执再读；不要让它 sleep 或轮询另一个子代理。\n"
     "   验收：追加的每一条都要在它最终回执里逐条对上，对不上 ＝ 未完成。\n"
+    "6) 这批活若还要改别的文件、或改动明显超过阈值：不要逐笔试探，把其余改动一并写进同一条 brief，\n"
+    "   一次交给同一个子代理做完；不要先自己写几笔（那几笔不回收）再派剩下的。\n"
     "说明：子代理会话不受本闸门拦截；本轮不再放行——重试同一写入只会再收到这份指令，"
     "直到本轮结束（下一轮重新上锁、需重新批准）。"
 )
@@ -473,6 +505,17 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "
         # 此处只放 memory，write_file / patch / terminal 仍拦。
         if tool_name == "memory" and _is_unattended_review():
             return None
+        # 子代理派发同样要经确认：否则模型学会「写入就派子代理」即可绕过整条闸门
+        # （子代理会话在 _exempt 里整体豁免，派出去之后没人管）。这里只判「本轮是否
+        # 已批准」——不转派、不弹第二张卡；批准后本轮内 delegate_task / steer 一律
+        # 放行，下一轮 turn_id 变化重新上锁。
+        if tool_name == "delegate_task":
+            with _LOCK:
+                du = _unlock.get(session_id)
+                d_open = bool(du and (du[0] == "session" or (du[0] == "turn" and du[1] and du[1] == turn_id)))
+            if d_open:
+                return None
+            return {"action": "block", "message": _DISPATCH_MSG}
         if not _is_write(tool_name, args):
             return None
         with _LOCK:
@@ -485,7 +528,7 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "
                                and tool_name != "memory")
             already = bool(turn_scoped and _redirected.get(session_id) == turn_id)
         if not unlocked:
-            return {"action": "block", "message": _BLOCK_MSG}
+            return {"action": "block", "message": _block_msg()}
         if turn_scoped and _delegate_after_approval():
             if already:
                 # 本轮已转派过：不放行，重复同一份指令。重试不能把转派绕过去；

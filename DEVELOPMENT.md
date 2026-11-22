@@ -6,7 +6,7 @@
 
 - GitHub: https://github.com/SleepingPig114514/write-gate
 - Gitee 镜像: https://gitee.com/he-shuying/write-gate
-- 当前版本：v1.1.5（HEAD: `4e7debf`）
+- 当前版本：v1.1.8
 - 运行时副本：`C:\Users\12\AppData\Local\hermes\plugins\write-gate\`（Hermes 按需 import）
 - 用户文档：[README.md](README.md)
 
